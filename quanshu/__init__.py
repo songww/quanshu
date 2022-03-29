@@ -8,9 +8,11 @@ import logging.config
 
 import click
 
-from .quanshu import *
+from . import loggers
+from . import quanshu as qs
+from .config import Config
 
-__doc__ = quanshu.__doc__
+__doc__ = qs.__doc__
 
 TRACE_LOG_LEVEL = 5
 
@@ -25,7 +27,7 @@ LOG_LEVELS = {
 
 LOOP_CHOICES = click.Choice(["uvloop", "asyncio"])
 INTERFACE_CHOICES = click.Choice(["asgi2", "asgi3"])
-LEVEL_CHOICES = click.Choice([])
+LEVEL_CHOICES = click.Choice(list(LOG_LEVELS.keys()))
 
 LOGGING_CONFIG: dict = {
     "version": 1,
@@ -58,7 +60,7 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     click.echo(
         "Running quanshu %s with %s %s on %s"
         % (
-            quanshu.__version__,
+            qs.__version__,
             platform.python_implementation(),
             platform.python_version(),
             platform.system(),
@@ -315,68 +317,58 @@ def main(
     ):
     if app_dir is not None:
         sys.path.insert(0, app_dir)
-    setup_logging(log_config or LOGGING_CONFIG, log_level, access_log, use_colors)
+    loggers.setup(log_config or LOGGING_CONFIG, log_level, access_log, use_colors)
     if loop == "uvloop":
         import uvloop
         uvloop.install()
-    opts = quanshu.Options(app)
-    opts.set_port(port)
-    opts.set_host(host)
-    opts.set_headers(headers)
-    if ssl_certfile:
-        opts.set_certfile(ssl_certfile, ssl_key_password)
-    if root_path:
-        opts.set_root_path(root_path)
-    asyncio.run(run(opts))
+
+    config = Config(
+        app,
+        host=host,
+        port=port,
+        uds=uds,
+        fd=fd,
+        loop=loop,
+        ws_max_size=ws_max_size,
+        ws_ping_interval=ws_ping_interval,
+        ws_ping_timeout=ws_ping_timeout,
+        ws_per_message_deflate=ws_per_message_deflate,
+        lifespan=lifespan,
+        interface=interface,
+        debug=debug,
+        workers=workers,
+        env_file=env_file,
+        proxy_headers=proxy_headers,
+        server_header=server_header,
+        date_header=date_header,
+        forwarded_allow_ips=forwarded_allow_ips,
+        root_path=root_path,
+        limit_concurrency=limit_concurrency,
+        backlog=backlog,
+        limit_max_requests=limit_max_requests,
+        timeout_keep_alive=timeout_keep_alive,
+        ssl_certfile=ssl_certfile,
+        ssl_key_password=ssl_key_password,
+        ssl_ciphers=ssl_ciphers,
+        headers=headers,
+        app_dir=app_dir,
+        log_config = log_config,
+        log_level = log_level,
+        access_log = access_log,
+        use_colors = use_colors
+    )
+
+    #asyncio.run(serve(opts))
+    workers = workers or 1
+    if workers > 1:
+        from .supervisors import Supervisor
+        Supervisor(config, serve).run()
+    else:
+        asyncio.run(serve(config.options()))
     if uds:
         os.remove(uds)  # pragma: py-win32
 
-async def run(opts: quanshu.Options):
+async def serve(opts: qs.Options):
     """workaround for https://pyo3.rs/v0.16.2/ecosystem/async-await.html#a-note-about-asynciorun
     """
-    await quanshu.run(opts)
-
-def setup_logging(log_config: t.Optional[t.Union[t.Dict, str, None]],
-                  log_level: t.Optional[t.Union[int, str, None]],
-                  access_log: bool,
-                  use_colors: bool = False):
-    logging.addLevelName(TRACE_LOG_LEVEL, "TRACE")
-
-    if log_config is not None:
-        if isinstance(log_config, dict):
-            if use_colors in (True, False):
-                log_config["formatters"]["default"][
-                    "use_colors"
-                ] = use_colors
-                log_config["formatters"]["access"][
-                    "use_colors"
-                ] = use_colors
-            logging.config.dictConfig(log_config)
-        elif log_config.endswith(".json"):
-            import json
-            with open(log_config) as file:
-                loaded_config = json.load(file)
-                logging.config.dictConfig(loaded_config)
-        elif log_config.endswith((".yaml", ".yml")):
-            import yaml
-            with open(log_config) as file:
-                loaded_config = yaml.safe_load(file)
-                logging.config.dictConfig(loaded_config)
-        else:
-            # See the note about fileConfig() here:
-            # https://docs.python.org/3/library/logging.config.html#configuration-file-format
-            logging.config.fileConfig(
-                log_config, disable_existing_loggers=False
-            )
-
-    if log_level is not None:
-        if isinstance(log_level, str):
-            log_level = LOG_LEVELS[log_level]
-        else:
-            log_level = log_level
-        logging.getLogger("quanshu.error").setLevel(log_level)
-        logging.getLogger("quanshu.access").setLevel(log_level)
-        logging.getLogger("quanshu.asgi").setLevel(log_level)
-    if access_log is False:
-        logging.getLogger("quanshu.access").handlers = []
-        logging.getLogger("quanshu.access").propagate = False
+    await qs.run(opts)

@@ -6,6 +6,7 @@ use pyo3::{
     prelude::*,
     types::{IntoPyDict, PyDict, PyList, PyString},
 };
+use pyo3_asyncio::TaskLocals;
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender},
     Mutex,
@@ -464,12 +465,13 @@ impl SenderAwaitable {
 
 #[pyclass]
 pub struct Sender {
+    locals: TaskLocals,
     inner: UnboundedSender<Send>,
 }
 
 impl Sender {
-    pub fn new(tx: UnboundedSender<Send>) -> Sender {
-        Sender { inner: tx }
+    pub fn new(locals: TaskLocals, tx: UnboundedSender<Send>) -> Sender {
+        Sender { locals, inner: tx }
     }
 }
 
@@ -481,7 +483,7 @@ impl Sender {
         log::trace!("event: {:?}", event);
         let sender = self.inner.clone();
         log::trace!("sender");
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_asyncio::tokio::future_into_py_with_locals(py, self.locals.clone(), async move {
             log::trace!("sender sending");
             sender
                 .send(event)
@@ -492,13 +494,14 @@ impl Sender {
 
 #[pyclass]
 pub struct Receiver {
-    // body: hyper::Request<hyper::Body>,
+    locals: TaskLocals,
     rx: Arc<Mutex<UnboundedReceiver<Receive>>>,
 }
 
 impl Receiver {
-    pub fn new(rx: UnboundedReceiver<Receive>) -> Receiver {
+    pub fn new(locals: TaskLocals, rx: UnboundedReceiver<Receive>) -> Receiver {
         Receiver {
+            locals,
             rx: Arc::new(Mutex::new(rx)),
         }
     }
@@ -519,7 +522,7 @@ impl Receiver {
     fn __call__<'a>(&'a self, py: Python<'a>) -> PyResult<&'a PyAny> {
         // let mut body = &mut self.body;
         let rx = self.rx.clone();
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        pyo3_asyncio::tokio::future_into_py_with_locals(py, self.locals.clone(), async move {
             // receiver
             //     .recv()
             //     .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))

@@ -11,6 +11,7 @@ use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpSocket;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_native_tls::native_tls::{Identity, TlsAcceptor};
 use tokio_native_tls::TlsStream;
@@ -186,11 +187,11 @@ impl AsyncWrite for Stream {
 pub struct Acceptor(Option<tokio_native_tls::TlsAcceptor>);
 
 impl Acceptor {
-    async fn accept(&self, tcp: TcpStream) -> anyhow::Result<Stream> {
+    async fn accept(&self, stream: TcpStream) -> anyhow::Result<Stream> {
         Ok(if let Some(ref acceptor) = self.0 {
-            Stream::TlsStream(acceptor.accept(tcp).await?)
+            Stream::TlsStream(acceptor.accept(stream).await?)
         } else {
-            Stream::TcpStream(tcp)
+            Stream::TcpStream(stream)
         })
     }
 }
@@ -198,7 +199,17 @@ impl Acceptor {
 async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<()> {
     let addr = SocketAddr::new(opts.host, opts.port);
 
-    let tcp: TcpListener = TcpListener::bind(&addr).await?;
+    let sock = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    sock.set_reuseaddr(true)?;
+    sock.set_reuseport(true)?;
+    sock.bind(addr)?;
+
+    // let listener: TcpListener = TcpListener::bind(&addr).await?;
+    let listener = sock.listen(1024)?;
 
     let acceptor = if let Some(pkcs12) = opts.pkcs12.take() {
         // let der = std::fs::read(&pkcs12)?;
@@ -218,7 +229,7 @@ async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<
 
     loop {
         // Asynchronously wait for an inbound socket.
-        let (socket, remote_addr) = tcp.accept().await?;
+        let (socket, remote_addr) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let http = http.clone();
         let opts = opts.clone();
@@ -251,13 +262,13 @@ async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<
 }
 
 #[pyfunction]
-fn run<'p>(py: Python<'p>, opts: &'p PyAny) -> PyResult<&'p PyAny> {
-    let opts: Options = opts.extract()?;
+fn run<'p>(py: Python<'p>, opts: PyRef<Options>) -> PyResult<&'p PyAny> {
+    let opts: Options = opts.clone();
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .worker_threads(8)
-        .thread_name("quanshu-connection")
+        .thread_name("quanshu-worker")
         .enable_io()
         .enable_time();
 

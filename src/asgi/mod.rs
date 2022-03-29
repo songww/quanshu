@@ -88,13 +88,16 @@ impl Asgi {
                 Some(self.ctx.remote_addr.into()),
                 self.ctx.local_addr.into(),
             );
+
+            let locals = self.ctx.locals.clone();
+
             let (req_tx, rx) = unbounded();
 
             let (tx, mut resp_rx) = unbounded();
 
             let fut = pyo3::Python::with_gil(|py| -> PyResult<_> {
-                let receive = Py::new(py, specs::Receiver::new(rx))?;
-                let send = Py::new(py, specs::Sender::new(tx))?;
+                let receive = Py::new(py, specs::Receiver::new(locals.clone(), rx))?;
+                let send = Py::new(py, specs::Sender::new(locals.clone(), tx))?;
                 let coro = self
                     .app
                     .call1(py, (scope.into_py_dict(py), receive, send))?;
