@@ -26,6 +26,7 @@ struct Options {
     fd: Option<i64>,
     pkcs12: Option<Identity>,
     headers: Vec<(String, String)>,
+    workers: Option<usize>,
     root_path: String,
 }
 
@@ -75,6 +76,7 @@ impl Options {
             fd: None,
             pkcs12: None,
             headers: Vec::new(),
+            workers: None,
             root_path: String::new(),
         })
     }
@@ -95,6 +97,14 @@ impl Options {
     /// eg: `/tmp/quanshu.sock`
     fn set_uds(&mut self, uds: &str) {
         self.uds.replace(uds.to_string());
+    }
+
+    fn set_workers(&mut self, workers: usize) {
+        self.workers.replace(workers);
+    }
+
+    fn workers(&self) -> usize {
+        self.workers.map(|w| w + 1).unwrap_or(1)
     }
 
     /// A DER-formatted PKCS #12 archive, using the specified password to decrypt the key.
@@ -267,7 +277,7 @@ fn run<'p>(py: Python<'p>, opts: PyRef<Options>) -> PyResult<&'p PyAny> {
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
-        .worker_threads(8)
+        .worker_threads(1)
         .thread_name("quanshu-worker")
         .enable_io()
         .enable_time();
