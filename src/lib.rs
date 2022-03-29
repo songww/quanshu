@@ -121,7 +121,6 @@ impl Options {
     }
 
     fn enable_server_header(&mut self, enable: bool) {
-        println!("server header enabled: {}", enable);
         self.server_header_enabled = enable;
     }
 

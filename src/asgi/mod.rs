@@ -15,11 +15,6 @@ use tokio::sync::mpsc::unbounded_channel as unbounded;
 
 use crate::Options;
 
-static INITIAL: &str = "import uvloop
-uvloop.install()
-import asyncio
-";
-
 #[derive(Debug, Clone)]
 pub(crate) struct Context {
     locals: TaskLocals,

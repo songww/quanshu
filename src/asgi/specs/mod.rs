@@ -2,9 +2,9 @@ use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
 use hyper::body::HttpBody;
 use pyo3::{
-    exceptions::{PyException, PyValueError},
+    exceptions::{PyException, PyKeyError, PyValueError},
     prelude::*,
-    types::{IntoPyDict, PyDict, PyList, PyString},
+    types::{IntoPyDict, PyDict, PyIterator, PyList, PySequence, PyString, PyTuple},
 };
 use pyo3_asyncio::TaskLocals;
 use tokio::sync::{
@@ -454,16 +454,6 @@ pub enum Send {
 }
 
 #[pyclass]
-pub struct SenderAwaitable {
-    sender: Sender,
-}
-
-#[pymethods]
-impl SenderAwaitable {
-    // fn __await__(
-}
-
-#[pyclass]
 pub struct Sender {
     locals: TaskLocals,
     inner: UnboundedSender<Send>,
@@ -475,18 +465,83 @@ impl Sender {
     }
 }
 
+fn parse_headers(headers: &PyAny) -> PyResult<Vec<(Vec<u8>, Vec<u8>)>> {
+    headers
+        .iter()?
+        .map(|header| -> PyResult<(Vec<u8>, Vec<u8>)> {
+            let header = header?.cast_as::<PySequence>()?;
+            if header.len()? != 2 {
+                Err(PyErr::new::<PyValueError, _>(format!(
+                    "header required two elements for `name` and `value`, but not `{}`",
+                    header
+                )))
+            } else {
+                Ok((
+                    header.get_item(0)?.extract()?,
+                    header.get_item(1)?.extract()?,
+                ))
+            }
+        })
+        .collect()
+}
+
 #[pymethods]
 impl Sender {
     fn __call__<'a>(&'a self, py: Python<'a>, event: &'a PyDict) -> PyResult<&'a PyAny> {
         log::trace!("Sender: {:?}", event);
-        let event = event.extract().expect("extract failed");
-        log::trace!("event: {:?}", event);
+        let stype: &str = event
+            .get_item("type")
+            .ok_or_else(|| PyErr::new::<PyKeyError, _>("type"))?
+            .extract()?;
+        let type_: Type = stype.parse().map_err(|err| {
+            PyErr::new::<PyValueError, _>(format!("type `{:?}` is invalid, {:?}", stype, err))
+        })?;
+        log::trace!("type: {:?}", type_);
+        let message = match type_ {
+            Type::HttpResponseStart => {
+                let status: u16 = event
+                    .get_item("status")
+                    .ok_or_else(|| PyErr::new::<PyKeyError, _>("status"))?
+                    .extract()?;
+                log::trace!("status: {:?}", status);
+                let headers = if let Some(headers) = event.get_item("headers") {
+                    parse_headers(headers)?
+                } else {
+                    vec![]
+                };
+                log::trace!("headers: {:?}", headers);
+                Send::ResponseStart {
+                    type_,
+                    status,
+                    headers,
+                }
+            }
+            Type::HttpResponseBody => {
+                let body: Vec<u8> = if let Some(body) = event.get_item("body") {
+                    body.extract()?
+                } else {
+                    vec![]
+                };
+                let more_body: bool = if let Some(more) = event.get_item("more_body") {
+                    more.extract()?
+                } else {
+                    false
+                };
+                Send::ResponseBody {
+                    type_,
+                    body,
+                    more_body,
+                }
+            }
+            _ => unreachable!(),
+        };
+        log::trace!("message: {:?}", message);
         let sender = self.inner.clone();
         log::trace!("sender");
         pyo3_asyncio::tokio::future_into_py_with_locals(py, self.locals.clone(), async move {
             log::trace!("sender sending");
             sender
-                .send(event)
+                .send(message)
                 .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
         })
     }
@@ -507,42 +562,16 @@ impl Receiver {
     }
 }
 
-#[pyclass]
-pub struct ReceiverAwaitable {
-    // receiver: Receiver,
-}
-
-#[pymethods]
-impl ReceiverAwaitable {
-    // fn __await__
-}
-
 #[pymethods]
 impl Receiver {
     fn __call__<'a>(&'a self, py: Python<'a>) -> PyResult<&'a PyAny> {
-        // let mut body = &mut self.body;
         let rx = self.rx.clone();
         pyo3_asyncio::tokio::future_into_py_with_locals(py, self.locals.clone(), async move {
-            // receiver
-            //     .recv()
-            //     .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
             rx.lock()
                 .await
                 .recv()
                 .await
                 .ok_or_else(|| PyErr::new::<PyException, _>("Connection Closed"))
-            // if let Some(data) = body.data().await {
-            //     let data = data.map_err(|err| anyhow::anyhow!("ReadBuf failed {}", err))?;
-            //     Ok(Receive::HttpRequest {
-            //         body: &data,
-            //         more_body: true,
-            //     })
-            // } else {
-            //     Ok(Receive::HttpRequest {
-            //         body: &[],
-            //         more_body: false,
-            //     })
-            // }
         })
     }
 }
