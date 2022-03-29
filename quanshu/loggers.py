@@ -1,12 +1,22 @@
 import http
 import logging
+import logging.config
 import sys
 from copy import copy
-from typing import Optional
+import typing as t
 
 import click
 
 TRACE_LOG_LEVEL = 5
+
+LOG_LEVELS = {
+    "critical": logging.CRITICAL,
+    "error": logging.ERROR,
+    "warning": logging.WARNING,
+    "info": logging.INFO,
+    "debug": logging.DEBUG,
+    "trace": TRACE_LOG_LEVEL,
+}
 
 
 class ColourizedFormatter(logging.Formatter):
@@ -30,10 +40,10 @@ class ColourizedFormatter(logging.Formatter):
 
     def __init__(
         self,
-        fmt: Optional[str] = None,
-        datefmt: Optional[str] = None,
+        fmt: t.Optional[str] = None,
+        datefmt: t.Optional[str] = None,
         style: str = "%",
-        use_colors: Optional[bool] = None,
+        use_colors: t.Optional[bool] = None,
     ):
         if use_colors in (True, False):
             self.use_colors = use_colors
@@ -67,3 +77,49 @@ class ColourizedFormatter(logging.Formatter):
 class DefaultFormatter(ColourizedFormatter):
     def should_use_colors(self) -> bool:
         return sys.stderr.isatty()  # pragma: no cover
+
+
+def setup(log_config: t.Optional[t.Union[t.Dict, str, None]],
+          log_level: t.Optional[t.Union[int, str, None]],
+          access_log: bool,
+          use_colors: bool = False):
+    logging.addLevelName(TRACE_LOG_LEVEL, "TRACE")
+
+    if log_config is not None:
+        if isinstance(log_config, dict):
+            if use_colors in (True, False):
+                log_config["formatters"]["default"][
+                    "use_colors"
+                ] = use_colors
+                log_config["formatters"]["access"][
+                    "use_colors"
+                ] = use_colors
+            logging.config.dictConfig(log_config)
+        elif log_config.endswith(".json"):
+            import json
+            with open(log_config) as file:
+                loaded_config = json.load(file)
+                logging.config.dictConfig(loaded_config)
+        elif log_config.endswith((".yaml", ".yml")):
+            import yaml
+            with open(log_config) as file:
+                loaded_config = yaml.safe_load(file)
+                logging.config.dictConfig(loaded_config)
+        else:
+            # See the note about fileConfig() here:
+            # https://docs.python.org/3/library/logging.config.html#configuration-file-format
+            logging.config.fileConfig(
+                log_config, disable_existing_loggers=False
+            )
+
+    if log_level is not None:
+        if isinstance(log_level, str):
+            log_level = LOG_LEVELS[log_level]
+        else:
+            log_level = log_level
+        logging.getLogger("quanshu.error").setLevel(log_level)
+        logging.getLogger("quanshu.access").setLevel(log_level)
+        logging.getLogger("quanshu.asgi").setLevel(log_level)
+    if access_log is False:
+        logging.getLogger("quanshu.access").handlers = []
+        logging.getLogger("quanshu.access").propagate = False

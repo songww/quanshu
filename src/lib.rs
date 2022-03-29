@@ -3,6 +3,14 @@ mod asgi;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::prelude::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::prelude::IntoRawFd;
+#[cfg(windows)]
+use std::os::windows::io::FromRawSocket;
+#[cfg(windows)]
+use std::os::windows::io::IntoRawSocket;
 use std::pin::Pin;
 use std::str::FromStr;
 
@@ -10,22 +18,79 @@ use hyper::{server::conn::Http, service::service_fn};
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyString;
+use pyo3_asyncio::TaskLocals;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpSocket;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::OnceCell;
 use tokio_native_tls::native_tls::{Identity, TlsAcceptor};
 use tokio_native_tls::TlsStream;
 
-#[pyclass]
-#[derive(Clone)]
-struct Options {
-    app: PyObject,
+#[pyclass(module = "quanshu")]
+#[derive(Clone, Debug)]
+struct BindOptions {
     host: IpAddr,
     port: u16,
     uds: Option<String>,
-    fd: Option<i64>,
+    fd: Option<RawFd>,
+}
+
+#[pymethods]
+impl BindOptions {
+    #[new]
+    fn new() -> PyResult<BindOptions> {
+        Ok(BindOptions {
+            host: Ipv4Addr::LOCALHOST.into(),
+            port: 8000,
+            uds: None,
+            fd: None,
+        })
+    }
+    /// default is "127.0.0.1"
+    fn set_host(&mut self, host: &str) -> PyResult<()> {
+        self.host = IpAddr::from_str(host).map_err(|err| anyhow::anyhow!(err))?;
+        Ok(())
+    }
+
+    /// default is 8000
+    fn set_port(&mut self, port: u16) -> PyResult<()> {
+        self.port = port;
+        Ok(())
+    }
+
+    /// Bind to a UNIX domain socket.
+    /// eg: `/tmp/quanshu.sock`
+    fn set_uds(&mut self, uds: &str) {
+        self.uds.replace(uds.to_string());
+    }
+
+    fn set_fd(&mut self, fd: RawFd) {
+        self.fd.replace(fd);
+    }
+}
+
+#[pyclass(module = "quanshu")]
+struct Options {
+    app: PyObject,
     pkcs12: Option<Identity>,
     headers: Vec<(String, String)>,
     root_path: String,
+
+    bind_options: Option<BindOptions>,
+}
+
+impl Clone for Options {
+    fn clone(&self) -> Self {
+        Options {
+            // socket: None,
+            pkcs12: None,
+            app: self.app.clone(),
+            headers: self.headers.clone(),
+            root_path: self.root_path.clone(),
+
+            bind_options: self.bind_options.clone(),
+        }
+    }
 }
 
 #[pymethods]
@@ -66,34 +131,15 @@ impl Options {
                 app
             }
         };
+        println!("loaded app: {:?}", app);
         Ok(Options {
             app: app.to_object(py),
-            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 8000,
-            uds: None,
-            fd: None,
             pkcs12: None,
             headers: Vec::new(),
             root_path: String::new(),
+
+            bind_options: None,
         })
-    }
-
-    /// default is "127.0.0.1"
-    fn set_host(&mut self, host: &str) -> PyResult<()> {
-        self.host = IpAddr::from_str(host).map_err(|err| anyhow::anyhow!(err))?;
-        Ok(())
-    }
-
-    /// default is 8000
-    fn set_port(&mut self, port: u16) -> PyResult<()> {
-        self.port = port;
-        Ok(())
-    }
-
-    /// Bind to a UNIX domain socket.
-    /// eg: `/tmp/quanshu.sock`
-    fn set_uds(&mut self, uds: &str) {
-        self.uds.replace(uds.to_string());
     }
 
     /// A DER-formatted PKCS #12 archive, using the specified password to decrypt the key.
@@ -128,6 +174,14 @@ impl Options {
     /// "Set the ASGI 'root_path' for applications submounted below a given URL path.",
     fn set_root_path(&mut self, root_path: String) {
         self.root_path = root_path;
+    }
+
+    fn set_bind_options(&mut self, bind_options: BindOptions) {
+        println!(
+            "----------------bind options----------------{:?}",
+            bind_options
+        );
+        self.bind_options.replace(bind_options);
     }
 }
 
@@ -195,15 +249,24 @@ impl Acceptor {
     }
 }
 
-async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<()> {
-    let addr = SocketAddr::new(opts.host, opts.port);
+#[cfg(unix)]
+type RawFd = std::os::unix::io::RawFd;
+#[cfg(windows)]
+type RawFd = std::os::windows::io::RawSocket;
 
-    let tcp: TcpListener = TcpListener::bind(&addr).await?;
+async fn serve_(locals: TaskLocals, mut opts: Options, socket: Option<TcpSocket>) -> PyResult<()> {
+    println!("serve bind options: {:?}", opts.bind_options);
+    let bind_options = opts.bind_options.take().expect("bind options not set yet");
+
+    let socket = socket.unwrap_or_else(|| unsafe {
+        TcpSocket::from_raw_fd(bind(&bind_options).unwrap().into_raw_fd())
+    });
+
+    let listener = socket.listen(100)?;
+
+    let addr = listener.local_addr()?;
 
     let acceptor = if let Some(pkcs12) = opts.pkcs12.take() {
-        // let der = std::fs::read(&pkcs12)?;
-        // let cert = Identity::from_pkcs12(&der, "")
-        //     .map_err(|err| PyErr::new::<PyValueError, _>(format!("Invalid certificate {}", err)))?;
         Acceptor(Some(tokio_native_tls::TlsAcceptor::from(
             TlsAcceptor::builder(pkcs12).build().map_err(|err| {
                 PyErr::new::<PyValueError, _>(format!("Unsupported certificate {}", err))
@@ -216,9 +279,13 @@ async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<
     let mut http = Http::new();
     http.http1_keep_alive(true);
 
+    println!("----------------before loop");
+
     loop {
+        println!("----------------before accept");
         // Asynchronously wait for an inbound socket.
-        let (socket, remote_addr) = tcp.accept().await?;
+        let (socket, remote_addr) = listener.accept().await.expect("accept failed");
+        println!("----------------accept {}", remote_addr);
         let acceptor = acceptor.clone();
         let http = http.clone();
         let opts = opts.clone();
@@ -227,15 +294,18 @@ async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<
         println!("accept connection from {}", remote_addr);
         tokio::spawn(async move {
             // Accept the TLS connection.
-            // let mut conn = tls_acceptor.accept(socket).await.expect("accept error");
+            log::trace!("before acceptor");
             let conn = acceptor.accept(socket).await.expect("accept error");
+            log::trace!("after acceptor");
 
             let service = service_fn({
                 move |req| {
+                    log::trace!("req");
                     let app = app.clone();
                     let opts = opts.clone();
                     let locals = locals.clone();
                     pyo3_asyncio::tokio::scope(locals.clone(), async move {
+                        log::trace!("scope");
                         let ctx = asgi::Context::new(locals, addr, remote_addr);
                         let asgi = asgi::Asgi::new(app, ctx, opts);
                         asgi.serve(req).await
@@ -250,22 +320,162 @@ async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<
     }
 }
 
+enum Listener {
+    TcpListener(std::net::TcpListener),
+    #[cfg(unix)]
+    UnixListener(std::os::unix::net::UnixListener),
+}
+
+static SOCKET: OnceCell<Listener> = OnceCell::const_new();
+
+#[pyclass(module = "quanshu")]
+pub struct Socket {
+    socket: socket2::Socket,
+}
+
+impl Clone for Socket {
+    fn clone(&self) -> Self {
+        Socket {
+            socket: self.socket.try_clone().expect("Cannot clone this socket."),
+        }
+    }
+}
+
+#[pymethods]
+impl Socket {
+    fn try_clone(&self) -> std::io::Result<Socket> {
+        self.socket.try_clone().map(|socket| Socket { socket })
+    }
+}
+
 #[pyfunction]
-fn run<'p>(py: Python<'p>, opts: &'p PyAny) -> PyResult<&'p PyAny> {
-    let opts: Options = opts.extract()?;
+fn try_bind<'p>(opts: PyRef<BindOptions>) -> PyResult<RawFd> {
+    let sock = bind(&opts)?;
+    #[cfg(unix)]
+    let rawfd = sock.into_raw_fd();
+    #[cfg(windows)]
+    let rawfd = sock.into_raw_socket();
+    Ok(rawfd)
+}
 
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .worker_threads(8)
-        .thread_name("quanshu-connection")
-        .enable_io()
-        .enable_time();
+fn bind(opts: &BindOptions) -> anyhow::Result<socket2::Socket> {
+    let socket = if let Some(ref uds) = opts.uds {
+        #[cfg(not(unix))]
+        unimplemented!("uds only supported on unix.");
+        #[cfg(unix)]
+        let listener = tokio::net::UnixListener::bind(uds)?.into_std()?;
+        let socket = socket2::Socket::from(listener);
+        socket.set_reuse_port(true)?;
+        socket.set_reuse_address(true)?;
+        // SOCKET.set(Listener::UnixListener(listener)).ok();
+        socket
+    } else if let Some(fd) = opts.fd {
+        #[cfg(windows)]
+        let socket = unsafe { socket2::Socket::from_raw_socket(fd) };
+        #[cfg(unix)]
+        let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
+        println!("after from raw {}", fd);
+        socket.set_reuse_port(true).expect("cannot resue port");
+        println!("set reuse port {}", fd);
+        socket
+            .set_reuse_address(true)
+            .expect("cannot resuet address");
+        println!("set reuse address {}", fd);
+        socket
+    } else {
+        let addr = SocketAddr::new(opts.host, opts.port);
+        println!("bind addr: {:?}", addr);
+        let listener = std::net::TcpListener::bind(addr)?;
+        let socket = socket2::Socket::from(listener);
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+        socket.set_reuse_address(true)?;
+        socket
+    };
+    Ok(socket)
+}
 
-    pyo3_asyncio::tokio::init(builder);
+#[pyfunction]
+fn serve_on<'p>(py: Python<'p>, opts: PyRef<Options>, socket: &'p PyAny) -> PyResult<&'p PyAny> {
+    let opts: Options = opts.clone();
+
+    // let mut builder = tokio::runtime::Builder::new_current_thread();
+    // builder
+    //     // .worker_threads(2)
+    //     .thread_name("quanshu-connection")
+    //     .enable_io()
+    //     .enable_time();
+    //
+    // pyo3_asyncio::tokio::init(builder);
 
     let locals = Python::with_gil(|py| pyo3_asyncio::tokio::get_current_locals(py))?;
 
-    pyo3_asyncio::tokio::future_into_py(py, serve(locals, opts)).into()
+    let fd = Python::with_gil(|_py| {
+        let threading = py.import("threading").unwrap();
+        println!(
+            "serve on current thread: {:?}",
+            threading
+                .getattr("current_thread")
+                .unwrap()
+                .call0()
+                .unwrap()
+        );
+        // let socket = py.import("socket").unwrap();
+        // let sock = socket
+        //     .getattr("fromfd")
+        //     .unwrap()
+        //     .call1((
+        //         *fd,
+        //         socket.getattr("AF_UNIX").unwrap(),
+        //         socket.getattr("SOCK_STREAM").unwrap(),
+        //     ))
+        //     .unwrap();
+        // sock.call_method1(
+        //     "setsockopt",
+        //     (
+        //         socket.getattr("SOL_SOCKET").unwrap(),
+        //         socket.getattr("SO_REUSEADDR").unwrap(),
+        //         1,
+        //     ),
+        // )
+        // .unwrap();
+        // sock.call_method1("set_inheritable", (true,)).unwrap();
+        // let sock = socket.call_method0("dup").unwrap();
+        println!("rs serve on: {:?}", locals.event_loop(py));
+        let sock = socket;
+        println!("sockname: {}", sock.call_method0("getsockname").unwrap());
+        #[cfg(unix)]
+        {
+            sock.call_method0("fileno").unwrap().extract().unwrap()
+        }
+        #[cfg(windows)]
+        {
+            sock.call_method0("share").unwrap().extract().unwrap()
+        }
+    });
+
+    let socket = {
+        #[cfg(unix)]
+        let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
+        #[cfg(windows)]
+        let socket = unsafe { socket2::Socket::from_raw_socket(fd) };
+        socket.try_clone().unwrap()
+    };
+
+    socket.set_reuse_port(true).unwrap();
+    socket.set_reuse_address(true).unwrap();
+    println!("send buf size: {}", socket.send_buffer_size().unwrap());
+    println!("recv buf size: {}", socket.recv_buffer_size().unwrap());
+
+    pyo3_asyncio::tokio::future_into_py(
+        py,
+        serve_(
+            locals,
+            opts,
+            Some(TcpSocket::from_std_stream(socket.into())),
+        ),
+    )
+    .into()
 }
 
 /// A Python module implemented in Rust.
@@ -276,8 +486,11 @@ fn quanshu(py: Python, m: &PyModule) -> PyResult<()> {
         .install()
         .map_err(|err| PyErr::new::<PyException, _>(format!("Cannot set Logger {}", err)))?;
 
+    m.add_class::<Socket>()?;
     m.add_class::<Options>()?;
-    m.add_function(wrap_pyfunction!(run, m)?)?;
+    m.add_class::<BindOptions>()?;
+    m.add_function(wrap_pyfunction!(serve_on, m)?)?;
+    m.add_function(wrap_pyfunction!(try_bind, m)?)?;
 
     Ok(())
 }

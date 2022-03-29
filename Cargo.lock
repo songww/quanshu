@@ -798,6 +798,7 @@ dependencies = [
  "pyo3",
  "pyo3-asyncio",
  "pyo3-log",
+ "socket2",
  "tokio",
  "tokio-native-tls",
 ]

@@ -11,14 +11,9 @@ use pyo3::types::IntoPyDict;
 use pyo3_asyncio::tokio::scope as scope_future;
 use pyo3_asyncio::TaskLocals;
 use tokio::select;
-use tokio::sync::mpsc::unbounded_channel as unbounded;
+use tokio::sync::mpsc::channel as bounded;
 
 use crate::Options;
-
-static INITIAL: &str = "import uvloop
-uvloop.install()
-import asyncio
-";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Context {
@@ -69,6 +64,7 @@ impl Asgi {
         } else {
             // Handle regular HTTP requests here.
             let uri = request.uri();
+            println!("uri: {}", uri);
             let headers: Vec<_> = request
                 .headers()
                 .iter()
@@ -88,38 +84,81 @@ impl Asgi {
                 Some(self.ctx.remote_addr.into()),
                 self.ctx.local_addr.into(),
             );
-            let (req_tx, rx) = unbounded();
+            let (req_tx, rx) = bounded(4);
 
-            let (tx, mut resp_rx) = unbounded();
+            let (tx, mut resp_rx) = bounded(4);
 
+            let locals = self.ctx.locals.clone();
+            println!("acquiring gil");
             let fut = pyo3::Python::with_gil(|py| -> PyResult<_> {
-                let receive = Py::new(py, specs::Receiver::new(rx))?;
-                let send = Py::new(py, specs::Sender::new(tx))?;
+                println!("acquired gil");
+                let receive = Py::new(py, specs::Receiver::new(locals.clone(), rx))?;
+                let send = Py::new(py, specs::Sender::new(locals, tx))?;
                 let coro = self
                     .app
-                    .call1(py, (scope.into_py_dict(py), receive, send))?;
+                    .call1(py, (scope.into_py_dict(py), receive, send))
+                    .unwrap();
                 let el = self.ctx.locals.event_loop(py);
-                let task = el.call_method1("create_task", (coro,))?;
-                pyo3_asyncio::tokio::into_future(task)
+                let threading = py.import("threading").unwrap();
+                println!(
+                    "current thread: {:?}",
+                    threading
+                        .getattr("current_thread")
+                        .unwrap()
+                        .call0()
+                        .unwrap()
+                );
+                let asyncio = py.import("asyncio").unwrap();
+                // println!(
+                //     "running loop: {:?} cache event loop: {:?}",
+                //     asyncio
+                //         .getattr("get_running_loop")
+                //         .unwrap()
+                //         .call0()
+                //         .unwrap(),
+                //     el
+                // );
+                let run_coroutine_threadsafe = asyncio.getattr("run_coroutine_threadsafe").unwrap();
+                let fut = run_coroutine_threadsafe.call1((coro, el)).unwrap();
+                // let inspect = PyModule::from_code(
+                //     py,
+                //     "def inspect(fut): print('fut done:', fut)",
+                //     "inspect.py",
+                //     "inspect",
+                // )
+                // .unwrap();
+                // fut.call_method1("add_done_callback", (inspect.getattr("inspect").unwrap(),))
+                //     .unwrap();
+
+                Ok(fut.to_object(py))
+                // let task = el.call_method1("create_task", (coro,)).unwrap();
+                // pyo3_asyncio::tokio::into_future(task)
             })?;
-            let _app_process = tokio::spawn(scope_future(self.ctx.locals.clone(), fut));
+            // let _app_process = tokio::spawn(scope_future(self.ctx.locals.clone(), fut));
             while let Some(buf) = request.body_mut().data().await {
+                println!("reading more body");
                 let buf = buf?;
                 while buf.has_remaining() {
                     let chunk = buf.chunk();
-                    req_tx.send(specs::Receive::HttpRequest {
-                        body: chunk.to_vec(),
-                        more_body: true,
-                    })?;
+                    req_tx
+                        .send(specs::Receive::HttpRequest {
+                            body: chunk.to_vec(),
+                            more_body: true,
+                        })
+                        .await?;
                 }
             }
-            req_tx.send(specs::Receive::HttpRequest {
-                body: vec![],
-                more_body: false,
-            })?;
-            log::trace!("waiting resp");
+            println!("request read done.");
+            req_tx
+                .send(specs::Receive::HttpRequest {
+                    body: vec![],
+                    more_body: false,
+                })
+                .await?;
+            println!("waiting response");
+            println!("waiting resp");
             let head = resp_rx.recv().await;
-            log::trace!("waiting resp..");
+            println!("waiting resp..");
             let mut response_builder = Response::builder();
             if let Some(specs::Send::ResponseStart {
                 type_: _,
@@ -135,7 +174,7 @@ impl Asgi {
             } else {
                 anyhow::bail!("ResponseStart required!");
             };
-            log::trace!("waiting resp body");
+            println!("waiting resp body");
             let (mut body_sender, body) = Body::channel();
             if let Some(specs::Send::ResponseBody {
                 type_: _,
@@ -150,7 +189,7 @@ impl Asgi {
             } else {
                 anyhow::bail!("ResponseBody required!")
             }
-            let further = tokio::spawn(async move {
+            let _further = tokio::spawn(async move {
                 while let Some(specs::Send::ResponseBody {
                     type_: _,
                     body: chunk,
@@ -166,6 +205,12 @@ impl Asgi {
                         break;
                     }
                 }
+                println!("last");
+                // Python::with_gil(|py| {
+                //     let fut = fut.into_ref(py);
+                //     println!("{:?}", fut.call_method0("result").unwrap());
+                //     assert!(fut.call_method0("done").unwrap().is_true().unwrap());
+                // })
             });
             Ok(response_builder.body(body)?)
         }

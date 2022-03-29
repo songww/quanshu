@@ -1,31 +1,31 @@
 import os
 import sys
+import socket
+import uvloop
+import asyncio
 import platform
 import typing as t
-import asyncio
 import logging
 import logging.config
+import faulthandler
+
+faulthandler.enable()
 
 import click
 
-from .quanshu import *
+from . import loggers
+from . import quanshu as qs
+from .config import Config
 
-__doc__ = quanshu.__doc__
+uvloop.install()
+
+__doc__ = qs.__doc__
 
 TRACE_LOG_LEVEL = 5
 
-LOG_LEVELS = {
-    "critical": logging.CRITICAL,
-    "error": logging.ERROR,
-    "warning": logging.WARNING,
-    "info": logging.INFO,
-    "debug": logging.DEBUG,
-    "trace": TRACE_LOG_LEVEL,
-}
-
 LOOP_CHOICES = click.Choice(["uvloop", "asyncio"])
 INTERFACE_CHOICES = click.Choice(["asgi2", "asgi3"])
-LEVEL_CHOICES = click.Choice([])
+LEVEL_CHOICES = click.Choice(list(loggers.LOG_LEVELS.keys()))
 
 LOGGING_CONFIG: dict = {
     "version": 1,
@@ -51,6 +51,7 @@ LOGGING_CONFIG: dict = {
     },
 }
 
+SOCKET = None
 
 def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
     if not value or ctx.resilient_parsing:
@@ -65,6 +66,7 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
         )
     )
     ctx.exit()
+
 
 @click.command(context_settings={"auto_envvar_prefix": "QUANSHU"})
 @click.argument("app")
@@ -93,7 +95,7 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     "--workers",
     default=None,
     type=int,
-    help="Number of worker processes. Defaults to the $WEB_CONCURRENCY environment"
+    help="Number of worker processes. Defaults to the `multiprocessing.cpu_count()` environment"
     " variable if available, or 1. Not valid with --reload.",
 )
 @click.option(
@@ -312,71 +314,131 @@ def main(
     headers: t.List[str],
     use_colors: bool,
     app_dir: str,
-    ):
+):
     if app_dir is not None:
         sys.path.insert(0, app_dir)
-    setup_logging(log_config or LOGGING_CONFIG, log_level, access_log, use_colors)
     if loop == "uvloop":
         import uvloop
+
         uvloop.install()
-    opts = quanshu.Options(app)
-    opts.set_port(port)
-    opts.set_host(host)
-    opts.set_headers(headers)
-    if ssl_certfile:
-        opts.set_certfile(ssl_certfile, ssl_key_password)
-    if root_path:
-        opts.set_root_path(root_path)
-    asyncio.run(run(opts))
+    config = Config(
+        app,
+        host=host,
+        port=port,
+        uds=uds,
+        fd=fd,
+        loop=loop,
+        ws_max_size=ws_max_size,
+        ws_ping_interval=ws_ping_interval,
+        ws_ping_timeout=ws_ping_timeout,
+        ws_per_message_deflate=ws_per_message_deflate,
+        lifespan=lifespan,
+        interface=interface,
+        debug=debug,
+        workers=workers,
+        env_file=env_file,
+        proxy_headers=proxy_headers,
+        server_header=server_header,
+        date_header=date_header,
+        forwarded_allow_ips=forwarded_allow_ips,
+        root_path=root_path,
+        limit_concurrency=limit_concurrency,
+        backlog=backlog,
+        limit_max_requests=limit_max_requests,
+        timeout_keep_alive=timeout_keep_alive,
+        ssl_certfile=ssl_certfile,
+        ssl_key_password=ssl_key_password,
+        ssl_ciphers=ssl_ciphers,
+        headers=headers,
+        app_dir=app_dir,
+        log_config = log_config,
+        log_level = log_level,
+        access_log = access_log,
+        use_colors = use_colors
+    )
+    if use_colors:
+        config.use_colors = use_colors
+    run(config)
     if uds:
         os.remove(uds)  # pragma: py-win32
 
-async def run(opts: quanshu.Options):
-    """workaround for https://pyo3.rs/v0.16.2/ecosystem/async-await.html#a-note-about-asynciorun
-    """
-    await quanshu.run(opts)
 
-def setup_logging(log_config: t.Optional[t.Union[t.Dict, str, None]],
-                  log_level: t.Optional[t.Union[int, str, None]],
-                  access_log: bool,
-                  use_colors: bool = False):
-    logging.addLevelName(TRACE_LOG_LEVEL, "TRACE")
+def run(config: Config):
+    """workaround for https://pyo3.rs/v0.16.2/ecosystem/async-await.html#a-note-about-asynciorun"""
+    # SOCKET = qs.try_bind(config.bind_options)
+    config.socket = try_bind(config)
 
-    if log_config is not None:
-        if isinstance(log_config, dict):
-            if use_colors in (True, False):
-                log_config["formatters"]["default"][
-                    "use_colors"
-                ] = use_colors
-                log_config["formatters"]["access"][
-                    "use_colors"
-                ] = use_colors
-            logging.config.dictConfig(log_config)
-        elif log_config.endswith(".json"):
-            import json
-            with open(log_config) as file:
-                loaded_config = json.load(file)
-                logging.config.dictConfig(loaded_config)
-        elif log_config.endswith((".yaml", ".yml")):
-            import yaml
-            with open(log_config) as file:
-                loaded_config = yaml.safe_load(file)
-                logging.config.dictConfig(loaded_config)
-        else:
-            # See the note about fileConfig() here:
-            # https://docs.python.org/3/library/logging.config.html#configuration-file-format
-            logging.config.fileConfig(
-                log_config, disable_existing_loggers=False
-            )
+    workers = config.workers or 1
 
-    if log_level is not None:
-        if isinstance(log_level, str):
-            log_level = LOG_LEVELS[log_level]
-        else:
-            log_level = log_level
-        logging.getLogger("quanshu.error").setLevel(log_level)
-        logging.getLogger("quanshu.access").setLevel(log_level)
-        logging.getLogger("quanshu.asgi").setLevel(log_level)
-    if access_log is False:
-        logging.getLogger("quanshu.access").handlers = []
-        logging.getLogger("quanshu.access").propagate = False
+    from .supervisors import serve
+
+    if workers > 1:
+        from .supervisors import Supervisor
+
+        Supervisor(config=config, target=serve).run()
+    else:
+        logging.getLogger("asyncio").setLevel(logging.INFO)
+        asyncio.run(serve(config.options(), config.socket), debug=True)
+
+def try_bind(config: Config) -> socket.socket:
+    logger = logging.getLogger("uvicorn.error")
+    logger_args: t.List[t.Union[str, int]]
+    if config.uds:  # pragma: py-win32
+        path = config.uds
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(path)
+            uds_perms = 0o666
+            os.chmod(config.uds, uds_perms)
+        except OSError as exc:
+            logger.error(exc)
+            sys.exit(1)
+
+        message = "Uvicorn running on unix socket %s (Press CTRL+C to quit)"
+        sock_name_format = "%s"
+        color_message = (
+            "Uvicorn running on "
+            + click.style(sock_name_format, bold=True)
+            + " (Press CTRL+C to quit)"
+        )
+        logger_args = [config.uds]
+    elif config.fd:  # pragma: py-win32
+        sock = socket.fromfd(config.fd, socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        message = "Uvicorn running on socket %s (Press CTRL+C to quit)"
+        fd_name_format = "%s"
+        color_message = (
+            "Uvicorn running on "
+            + click.style(fd_name_format, bold=True)
+            + " (Press CTRL+C to quit)"
+        )
+        logger_args = [sock.getsockname()]
+    else:
+        family = socket.AF_INET
+        addr_format = "%s://%s:%d"
+
+        if config.host and ":" in config.host:  # pragma: py-win32
+            # It's an IPv6 address.
+            family = socket.AF_INET6
+            addr_format = "%s://[%s]:%d"
+
+        sock = socket.socket(family=family)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((config.host, config.port))
+        except OSError as exc:
+            logger.error(exc)
+            sys.exit(1)
+
+        message = f"Uvicorn running on {addr_format} (Press CTRL+C to quit)"
+        color_message = (
+            "Uvicorn running on "
+            + click.style(addr_format, bold=True)
+            + " (Press CTRL+C to quit)"
+        )
+        protocol_name = "https" if config.ssl_certfile else "http"
+        logger_args = [protocol_name, config.host, config.port]
+    logger.info(message, *logger_args, extra={"color_message": color_message})
+    sock.set_inheritable(True)
+    return sock
