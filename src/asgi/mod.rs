@@ -135,6 +135,9 @@ impl Asgi {
                     response_builder =
                         response_builder.header(std::str::from_utf8(&k)?, std::str::from_utf8(&v)?);
                 }
+                for (k, v) in self.opts.headers.iter() {
+                    response_builder = response_builder.header(k, v);
+                }
             } else {
                 anyhow::bail!("ResponseStart required!");
             };

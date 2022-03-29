@@ -11,10 +11,14 @@ use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpSocket;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio_native_tls::native_tls::{Identity, TlsAcceptor};
 use tokio_native_tls::TlsStream;
+
+#[cfg(unix)]
+type RawFd = std::os::unix::io::RawFd;
+#[cfg(windows)]
+type RawFd = std::os::windows::io::RawSocket;
 
 #[pyclass]
 #[derive(Clone)]
@@ -23,11 +27,14 @@ struct Options {
     host: IpAddr,
     port: u16,
     uds: Option<String>,
-    fd: Option<i64>,
+    fd: Option<RawFd>,
     pkcs12: Option<Identity>,
     headers: Vec<(String, String)>,
     workers: Option<usize>,
     root_path: String,
+    date_header_enabled: bool,
+    server_header_enabled: bool,
+    proxy_headers_enabled: bool,
 }
 
 #[pymethods]
@@ -78,6 +85,9 @@ impl Options {
             headers: Vec::new(),
             workers: None,
             root_path: String::new(),
+            date_header_enabled: true,
+            server_header_enabled: true,
+            proxy_headers_enabled: true,
         })
     }
 
@@ -95,12 +105,28 @@ impl Options {
 
     /// Bind to a UNIX domain socket.
     /// eg: `/tmp/quanshu.sock`
-    fn set_uds(&mut self, uds: &str) {
-        self.uds.replace(uds.to_string());
+    fn set_uds(&mut self, uds: String) {
+        self.uds.replace(uds);
     }
 
+    fn set_fd(&mut self, fd: RawFd) {
+        self.fd.replace(fd);
+    }
     fn set_workers(&mut self, workers: usize) {
         self.workers.replace(workers);
+    }
+
+    fn enable_date_header(&mut self, enable: bool) {
+        self.date_header_enabled = enable;
+    }
+
+    fn enable_server_header(&mut self, enable: bool) {
+        println!("server header enabled: {}", enable);
+        self.server_header_enabled = enable;
+    }
+
+    fn enable_proxy_headers(&mut self, enable: bool) {
+        self.proxy_headers_enabled = enable;
     }
 
     fn workers(&self) -> usize {
@@ -122,17 +148,8 @@ impl Options {
     }
 
     /// Specify custom default HTTP response headers as a Name:Value pair
-    fn set_headers(&mut self, headers: Vec<&str>) -> PyResult<()> {
-        let headers: anyhow::Result<Vec<(String, String)>> = headers
-            .iter()
-            .map(|header| {
-                let (k, v) = header.split_once(":").ok_or_else(|| {
-                    anyhow::anyhow!("Invalid header '{}', must be `Name:Value` pair.", header)
-                })?;
-                Ok((k.to_string(), v.to_string()))
-            })
-            .collect();
-        self.headers.extend(headers?);
+    fn set_headers(&mut self, headers: Vec<(String, String)>) -> PyResult<()> {
+        self.headers.extend(headers);
         Ok(())
     }
 
@@ -222,9 +239,6 @@ async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<
     let listener = sock.listen(1024)?;
 
     let acceptor = if let Some(pkcs12) = opts.pkcs12.take() {
-        // let der = std::fs::read(&pkcs12)?;
-        // let cert = Identity::from_pkcs12(&der, "")
-        //     .map_err(|err| PyErr::new::<PyValueError, _>(format!("Invalid certificate {}", err)))?;
         Acceptor(Some(tokio_native_tls::TlsAcceptor::from(
             TlsAcceptor::builder(pkcs12).build().map_err(|err| {
                 PyErr::new::<PyValueError, _>(format!("Unsupported certificate {}", err))
@@ -234,8 +248,20 @@ async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<
         Acceptor(None)
     };
 
+    if opts.server_header_enabled
+        && opts
+            .headers
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == "server")
+            .is_none()
+    {
+        opts.headers
+            .push(("Server".to_string(), "quanshu".to_string()));
+    }
+
     let mut http = Http::new();
-    http.http1_keep_alive(true);
+    // http.http1_keep_alive(true);
+    http.http1_preserve_header_case(true);
 
     loop {
         // Asynchronously wait for an inbound socket.

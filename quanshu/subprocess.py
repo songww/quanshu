@@ -69,5 +69,4 @@ def subprocess_started(
         import uvloop
         uvloop.install()
 
-    print("running in subprocess");
     asyncio.get_event_loop().run_until_complete(target(config.options()))

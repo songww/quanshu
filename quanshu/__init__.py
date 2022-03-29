@@ -16,18 +16,9 @@ __doc__ = qs.__doc__
 
 TRACE_LOG_LEVEL = 5
 
-LOG_LEVELS = {
-    "critical": logging.CRITICAL,
-    "error": logging.ERROR,
-    "warning": logging.WARNING,
-    "info": logging.INFO,
-    "debug": logging.DEBUG,
-    "trace": TRACE_LOG_LEVEL,
-}
-
 LOOP_CHOICES = click.Choice(["uvloop", "asyncio"])
 INTERFACE_CHOICES = click.Choice(["asgi2", "asgi3"])
-LEVEL_CHOICES = click.Choice(list(LOG_LEVELS.keys()))
+LEVEL_CHOICES = click.Choice(list(loggers.LOG_LEVELS.keys()))
 
 LOGGING_CONFIG: dict = {
     "version": 1,

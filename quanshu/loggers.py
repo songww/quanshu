@@ -18,7 +18,6 @@ LOG_LEVELS = {
     "trace": TRACE_LOG_LEVEL,
 }
 
-
 class ColourizedFormatter(logging.Formatter):
     """
     A custom log formatter class that:

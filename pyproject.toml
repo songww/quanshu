@@ -6,7 +6,15 @@ build-backend = "maturin"
 name = "quanshu"
 requires-python = ">=3.7"
 classifiers = [
+  "Environment :: Web Environment",
+  "Intended Audience :: Developers",
+  "Topic :: Internet :: WWW/HTTP",
   "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.7",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
@@ -14,13 +22,15 @@ classifiers = [
 dependencies = ["uvloop == 0.16", "click == 8", "pyyaml"]
 
 [project.optional-dependencies]
-test = ["pytest > 5.0.0", "pytest-cov[all]"]
+test = ["pytest > 5.0.0", "pytest-cov[all]", "pytest-asyncio", "httpx"]
 
 [project.urls]
-homepage = "example.com"
+homepage = "https://github.com/songww/quanshu"
 documentation = "readthedocs.org"
-repository = "github.com"
-changelog = "github.com/me/spam/blob/master/CHANGELOG.md"
+repository = "https://github.com/songww/quanshu"
+changelog = "github.com/songww/quanshu/blob/master/CHANGELOG.md"
 
 [project.scripts]
+quanshu = "quanshu:main"
+[project.console_scripts]
 quanshu = "quanshu:main"
