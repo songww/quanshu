@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from quanshu import Config, serve
+from quanshu import quanshu as qs
 
 
 @asynccontextmanager
@@ -14,6 +15,8 @@ async def run_server(config: Config, sockets=None):
     try:
         yield serving
     finally:
+        qs.shutdown()
+        await asyncio.sleep(0.5)
         cancel_handle.cancel()
 
 

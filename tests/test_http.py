@@ -89,11 +89,9 @@ async def test_get_request():
         async with httpx.AsyncClient() as client:
             response = await client.get("http://127.0.0.1:8000")
             assert response.http_version == "HTTP/1.1"
+            assert response.status_code == 200
             assert response.reason_phrase == "OK"
             assert response.content == b"Hello, world"
-            assert response.status_code == 200
-        #     assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
-        # assert b"Hello, world" in protocol.transport.buffer
 
 '''
 @pytest.mark.parametrize("path", ["/", "/?foo", "/?foo=bar", "/?foo=bar&baz=1"])
@@ -107,24 +105,28 @@ def test_request_logging(path, caplog, event_loop):
     app = Response("Hello, world", media_type="text/plain")
 
     with get_connected_protocol(
-        app, protocol_cls, event_loop, log_config=None
+        app, event_loop, log_config=None
     ) as protocol:
         protocol.data_received(get_request_with_query_string)
         protocol.loop.run_one()
         assert '"GET {} HTTP/1.1" 200'.format(path) in caplog.records[0].message
+'''
 
-
-@pytest.mark.parametrize("protocol_cls", HTTP_PROTOCOLS)
-def test_head_request(protocol_cls, event_loop):
+@pytest.mark.asyncio
+async def test_head_request(event_loop):
     app = Response("Hello, world", media_type="text/plain")
+    config = Config(app)
 
-    with get_connected_protocol(app, protocol_cls, event_loop) as protocol:
-        protocol.data_received(SIMPLE_HEAD_REQUEST)
-        protocol.loop.run_one()
-        assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
-        assert b"Hello, world" not in protocol.transport.buffer
+    async with run_server(config):
+        async with httpx.AsyncClient() as client:
+            response = await client.head("http://127.0.0.1:8000")
+            assert response.http_version == "HTTP/1.1"
+            assert response.status_code == 200
+            assert response.reason_phrase == "OK"
+            assert response.content == b""
 
 
+'''
 @pytest.mark.parametrize("protocol_cls", HTTP_PROTOCOLS)
 def test_post_request(protocol_cls, event_loop):
     async def app(scope, receive, send):

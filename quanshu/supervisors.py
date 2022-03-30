@@ -75,11 +75,3 @@ class Supervisor:
             click.style(str(self.pid), fg="cyan", bold=True)
         )
         logger.info(message, extra={"color_message": color_message})
-
-
-async def serve(options: qs.Options, socket: socket.socket):
-    import asyncio
-    print("python serve", asyncio.get_event_loop())
-    import threading
-    print("serve current thread: ", threading.current_thread())
-    await qs.serve_on(options, socket)
