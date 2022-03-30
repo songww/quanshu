@@ -1,6 +1,5 @@
 
 import os
-import socket
 import signal
 import logging
 import threading
@@ -56,13 +55,11 @@ class Supervisor:
         for sig in HANDLED_SIGNALS:
             signal.signal(sig, self.signal_handler)
 
-        self.sockets = []
         for idx in range(self.config.workers):
             process = get_subprocess(
                 config=self.config, target=self.target
             )
             process.start()
-            self.sockets.append(socket)
             self.processes.append(process)
 
     def shutdown(self) -> None:

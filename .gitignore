@@ -5,3 +5,6 @@ report.lua
 .venv
 __pycache__
 quanshu/quanshu.*.so
+perf.data
+perf.data.old
+flamegraph.svg

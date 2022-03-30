@@ -247,10 +247,10 @@ async fn bind(
         let domain = socket2::Domain::for_address(*addr);
         let typ = socket2::Type::STREAM.nonblocking();
         let socket = socket2::Socket::new(domain, typ, Some(socket2::Protocol::TCP))?;
-        socket.bind(&(*addr).into())?;
         socket.set_only_v6(false).ok();
         socket.set_reuse_port(true)?;
         socket.set_reuse_address(true)?;
+        socket.bind(&(*addr).into())?;
         socket.set_nonblocking(true)?;
         socket.listen(4096)?;
 
@@ -261,6 +261,7 @@ async fn bind(
             }
         }; // as Pin<Box<dyn stream::Stream<Item = (Stream, SocketAddr)>>>;
         map.insert(*addr, Box::pin(stream));
+        log::info!("quanshu listening on {}", addr);
     }
     Ok(map)
 }
@@ -300,6 +301,8 @@ async fn serve(
 
     // let mut futures = vec![];
 
+    let nested = subsys.start("shutingdown", shutingdown);
+
     loop {
         // Asynchronously wait for an inbound socket.
         let (stream, remote_addr) = tokio::select! {
@@ -325,6 +328,7 @@ async fn serve(
         log::info!("accept connection from {}", remote_addr);
         subsys.start("accept-connection", |subsys| conn_accepted.handle(subsys));
     }
+    subsys.perform_partial_shutdown(nested).await.ok();
     // check
     Ok(())
 }
@@ -377,8 +381,7 @@ async fn shutingdown(subsys: SubsystemHandle) -> anyhow::Result<()> {
 
 async fn graceful(locals: TaskLocals, opts: Options) -> PyResult<()> {
     let handle = Toplevel::new()
-        .start("serving", |h| serve(h, locals, opts))
-        .start("shutingdown", shutingdown)
+        .start("serving", |subsys| serve(subsys.clone(), locals, opts))
         .catch_signals()
         .handle_shutdown_requests(std::time::Duration::from_millis(500));
 
