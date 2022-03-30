@@ -1,31 +1,36 @@
 mod asgi;
 
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
 use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::pin::Pin;
-use std::str::FromStr;
 
+// use futures::stream::Stream as _;
 use hyper::{server::conn::Http, service::service_fn};
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyString;
+use pyo3_asyncio::TaskLocals;
+// use stream::Stream as _Stream;
+use stream::{Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_graceful_shutdown::{SubsystemHandle, Toplevel};
 use tokio_native_tls::native_tls::{Identity, TlsAcceptor};
 use tokio_native_tls::TlsStream;
+use tokio_stream as stream;
 
 #[cfg(unix)]
 type RawFd = std::os::unix::io::RawFd;
 #[cfg(windows)]
 type RawFd = std::os::windows::io::RawSocket;
 
+static SHUTDOWN: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 #[pyclass]
 #[derive(Clone)]
 struct Options {
     app: PyObject,
-    host: IpAddr,
-    port: u16,
+    addrs: Vec<SocketAddr>,
     uds: Option<String>,
     fd: Option<RawFd>,
     pkcs12: Option<Identity>,
@@ -77,8 +82,7 @@ impl Options {
         };
         Ok(Options {
             app: app.to_object(py),
-            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 8000,
+            addrs: "localhost:8000".to_socket_addrs()?.collect(),
             uds: None,
             fd: None,
             pkcs12: None,
@@ -92,14 +96,25 @@ impl Options {
     }
 
     /// default is "127.0.0.1"
-    fn set_host(&mut self, host: &str) -> PyResult<()> {
-        self.host = IpAddr::from_str(host).map_err(|err| anyhow::anyhow!(err))?;
+    fn set_hostport(&mut self, host: &str, port: u16) -> PyResult<()> {
+        self.addrs = (host, port)
+            .to_socket_addrs()
+            .map_err(|err| anyhow::anyhow!("{}: {}", err, host))?
+            // .map(|mut addr| {
+            //     if addr.is_ipv4() {
+            //         if let IpAddr::V4(v4) = addr.ip() {
+            //             addr.set_ip(IpAddr::V6(v4.to_ipv6_mapped()))
+            //         }
+            //     }
+            //     addr
+            // })
+            .collect();
         Ok(())
     }
 
     /// default is 8000
     fn set_port(&mut self, port: u16) -> PyResult<()> {
-        self.port = port;
+        self.addrs.iter_mut().for_each(|addr| addr.set_port(port));
         Ok(())
     }
 
@@ -158,33 +173,33 @@ impl Options {
     }
 }
 
-enum Stream {
+enum Connection {
     TlsStream(TlsStream<TcpStream>),
     TcpStream(TcpStream),
 }
 
-impl AsyncRead for Stream {
+impl AsyncRead for Connection {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Stream::TlsStream(ref mut s) => Pin::new(s).poll_read(cx, buf),
-            Stream::TcpStream(ref mut s) => Pin::new(s).poll_read(cx, buf),
+            Connection::TlsStream(ref mut s) => Pin::new(s).poll_read(cx, buf),
+            Connection::TcpStream(ref mut s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
 
-impl AsyncWrite for Stream {
+impl AsyncWrite for Connection {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         match self.get_mut() {
-            Stream::TlsStream(ref mut s) => Pin::new(s).poll_write(cx, buf),
-            Stream::TcpStream(ref mut s) => Pin::new(s).poll_write(cx, buf),
+            Connection::TlsStream(ref mut s) => Pin::new(s).poll_write(cx, buf),
+            Connection::TcpStream(ref mut s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -193,8 +208,8 @@ impl AsyncWrite for Stream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
-            Stream::TlsStream(ref mut s) => Pin::new(s).poll_flush(cx),
-            Stream::TcpStream(ref mut s) => Pin::new(s).poll_flush(cx),
+            Connection::TlsStream(ref mut s) => Pin::new(s).poll_flush(cx),
+            Connection::TcpStream(ref mut s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -203,8 +218,8 @@ impl AsyncWrite for Stream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
-            Stream::TlsStream(ref mut s) => Pin::new(s).poll_shutdown(cx),
-            Stream::TcpStream(ref mut s) => Pin::new(s).poll_shutdown(cx),
+            Connection::TlsStream(ref mut s) => Pin::new(s).poll_shutdown(cx),
+            Connection::TcpStream(ref mut s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -213,29 +228,49 @@ impl AsyncWrite for Stream {
 pub struct Acceptor(Option<tokio_native_tls::TlsAcceptor>);
 
 impl Acceptor {
-    async fn accept(&self, stream: TcpStream) -> anyhow::Result<Stream> {
+    async fn accept(&self, stream: TcpStream) -> anyhow::Result<Connection> {
         Ok(if let Some(ref acceptor) = self.0 {
-            Stream::TlsStream(acceptor.accept(stream).await?)
+            Connection::TlsStream(acceptor.accept(stream).await?)
         } else {
-            Stream::TcpStream(stream)
+            Connection::TcpStream(stream)
         })
     }
 }
 
-async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<()> {
-    let addr = SocketAddr::new(opts.host, opts.port);
+async fn bind(
+    opts: &Options,
+) -> anyhow::Result<
+    stream::StreamMap<SocketAddr, impl Stream<Item = std::io::Result<(TcpStream, SocketAddr)>>>,
+> {
+    let mut map = stream::StreamMap::with_capacity(opts.addrs.len());
+    for addr in opts.addrs.iter() {
+        let domain = socket2::Domain::for_address(*addr);
+        let typ = socket2::Type::STREAM.nonblocking();
+        let socket = socket2::Socket::new(domain, typ, Some(socket2::Protocol::TCP))?;
+        socket.bind(&(*addr).into())?;
+        socket.set_only_v6(false).ok();
+        socket.set_reuse_port(true)?;
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.listen(4096)?;
 
-    let sock = if addr.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
-    sock.set_reuseaddr(true)?;
-    sock.set_reuseport(true)?;
-    sock.bind(addr)?;
+        let listener = TcpListener::from_std(socket.into())?;
+        let stream = async_stream::try_stream! {
+            loop {
+                yield listener.accept().await?;
+            }
+        }; // as Pin<Box<dyn stream::Stream<Item = (Stream, SocketAddr)>>>;
+        map.insert(*addr, Box::pin(stream));
+    }
+    Ok(map)
+}
 
-    // let listener: TcpListener = TcpListener::bind(&addr).await?;
-    let listener = sock.listen(1024)?;
+async fn serve(
+    subsys: SubsystemHandle,
+    locals: pyo3_asyncio::TaskLocals,
+    mut opts: Options,
+) -> anyhow::Result<()> {
+    let mut listeners = bind(&opts).await?;
 
     let acceptor = if let Some(pkcs12) = opts.pkcs12.take() {
         Acceptor(Some(tokio_native_tls::TlsAcceptor::from(
@@ -259,41 +294,102 @@ async fn serve(locals: pyo3_asyncio::TaskLocals, mut opts: Options) -> PyResult<
     }
 
     let mut http = Http::new();
-    // http.http1_keep_alive(true);
     http.http1_preserve_header_case(true);
+    http.http1_keep_alive(false);
+    http.pipeline_flush(true);
+
+    // let mut futures = vec![];
 
     loop {
         // Asynchronously wait for an inbound socket.
-        let (socket, remote_addr) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let http = http.clone();
-        let opts = opts.clone();
-        let app = opts.app.clone();
-        let locals = locals.clone();
-        println!("accept connection from {}", remote_addr);
-        tokio::spawn(async move {
-            // Accept the TLS connection.
-            // let mut conn = tls_acceptor.accept(socket).await.expect("accept error");
-            let conn = acceptor.accept(socket).await.expect("accept error");
+        let (stream, remote_addr) = tokio::select! {
+            Some((_, next)) = listeners.next() => {
+                next?
+            }
+            _ = subsys.on_shutdown_requested() => {
+                break
+            }
+            else => break
+        };
 
-            let service = service_fn({
-                move |req| {
-                    let app = app.clone();
-                    let opts = opts.clone();
-                    let locals = locals.clone();
-                    pyo3_asyncio::tokio::scope(locals.clone(), async move {
-                        let ctx = asgi::Context::new(locals, addr, remote_addr);
-                        let asgi = asgi::Asgi::new(app, ctx, opts);
-                        asgi.serve(req).await
-                    })
-                }
-            });
-            // In a loop, read data from the socket and write the data back.
-            if let Err(err) = http.serve_connection(conn, service).await {
-                eprintln!("Error while serving HTTP connection: {:?}", err);
+        let conn_accepted = ConnAccepted {
+            local_addr: stream.local_addr()?,
+            remote_addr,
+            stream,
+            acceptor: acceptor.clone(),
+            http: http.clone(),
+            opts: opts.clone(),
+            app: opts.app.clone(),
+            locals: locals.clone(),
+        };
+        log::info!("accept connection from {}", remote_addr);
+        subsys.start("accept-connection", |subsys| conn_accepted.handle(subsys));
+    }
+    // check
+    Ok(())
+}
+
+struct ConnAccepted {
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    http: Http,
+    opts: Options,
+    app: Py<PyAny>,
+    stream: TcpStream,
+    locals: TaskLocals,
+    acceptor: Acceptor,
+}
+
+impl ConnAccepted {
+    async fn handle(self, _subsys: SubsystemHandle) -> anyhow::Result<()> {
+        // Accept the TLS connection.
+        let conn = self
+            .acceptor
+            .accept(self.stream)
+            .await
+            .expect("Accept failed");
+
+        let service = service_fn({
+            move |req| {
+                let app = self.app.clone();
+                let opts = self.opts.clone();
+                let locals = self.locals.clone();
+                pyo3_asyncio::tokio::scope(locals.clone(), async move {
+                    let ctx = asgi::Context::new(locals, self.local_addr, self.remote_addr);
+                    let asgi = asgi::Asgi::new(app, ctx, opts);
+                    asgi.serve(req).await
+                })
             }
         });
+        // In a loop, read data from the socket and write the data back.
+        if let Err(err) = self.http.serve_connection(conn, service).await {
+            log::trace!("Error while serving HTTP connection: {}", err);
+        }
+        Ok(())
     }
+}
+
+async fn shutingdown(subsys: SubsystemHandle) -> anyhow::Result<()> {
+    SHUTDOWN.notified().await;
+    subsys.request_shutdown();
+    Ok(())
+}
+
+async fn graceful(locals: TaskLocals, opts: Options) -> PyResult<()> {
+    let handle = Toplevel::new()
+        .start("serving", |h| serve(h, locals, opts))
+        .start("shutingdown", shutingdown)
+        .catch_signals()
+        .handle_shutdown_requests(std::time::Duration::from_millis(500));
+
+    // to map anyhow::Error -> pyo3::Error
+    handle.await?;
+    Ok(())
+}
+
+#[pyfunction]
+fn shutdown() {
+    SHUTDOWN.notify_one()
 }
 
 #[pyfunction]
@@ -311,7 +407,7 @@ fn run<'p>(py: Python<'p>, opts: PyRef<Options>) -> PyResult<&'p PyAny> {
 
     let locals = Python::with_gil(|py| pyo3_asyncio::tokio::get_current_locals(py))?;
 
-    pyo3_asyncio::tokio::future_into_py(py, serve(locals, opts)).into()
+    pyo3_asyncio::tokio::future_into_py(py, graceful(locals, opts)).into()
 }
 
 /// A Python module implemented in Rust.
@@ -324,6 +420,7 @@ fn quanshu(py: Python, m: &PyModule) -> PyResult<()> {
 
     m.add_class::<Options>()?;
     m.add_function(wrap_pyfunction!(run, m)?)?;
+    m.add_function(wrap_pyfunction!(shutdown, m)?)?;
 
     Ok(())
 }

@@ -14,9 +14,12 @@ crate-type = ["cdylib"]
 log = "0.4"
 anyhow = "1"
 futures = "0.3"
+socket2 = "0.4"
 pyo3-log = "0.6"
+async-stream = "0.3"
 tokio-native-tls = "0.3"
 hyper-tungstenite = "0.6"
+tokio-graceful-shutdown = "0.5"
 
 # [dependencies.clap]
 # version = "3"
@@ -25,6 +28,10 @@ hyper-tungstenite = "0.6"
 [dependencies.tokio]
 version = "1"
 features = ["net", "sync", "time", "io-std", "io-util", "rt-multi-thread"]
+
+[dependencies.tokio-stream]
+version = "0.1"
+features = ["net", "sync", "time", "io-util"]
 
 [dependencies.hyper]
 version = "0.14.18"
@@ -37,3 +44,8 @@ features = ["auto-initialize", "extension-module", "anyhow"]
 [dependencies.pyo3-asyncio]
 version = "0.16"
 features = ["attributes", "tokio-runtime"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

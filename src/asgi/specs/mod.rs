@@ -1,10 +1,9 @@
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
-use hyper::body::HttpBody;
 use pyo3::{
     exceptions::{PyException, PyKeyError, PyValueError},
     prelude::*,
-    types::{IntoPyDict, PyDict, PyIterator, PyList, PySequence, PyString, PyTuple},
+    types::{IntoPyDict, PyDict, PyList, PySequence, PyString},
 };
 use pyo3_asyncio::TaskLocals;
 use tokio::sync::{
