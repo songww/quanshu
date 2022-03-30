@@ -7,7 +7,7 @@ from . import quanshu as qs
 
 @dataclasses.dataclass
 class Config:
-    app: t.Union[t.Callable[..., None], str]
+    app: t.Union[t.Callable[..., t.Coroutine[t.Any, t.Any, None]], str]
     host: str = "127.0.0.1"
     port: int = 8000
     uds: t.Optional[str] = None
@@ -44,8 +44,7 @@ class Config:
     @property
     def bind_options(self):
         opts = qs.BindOptions()
-        opts.set_port(self.port)
-        opts.set_host(self.host)
+        opts.set_hostport(self.host, self.port)
         if self.uds:
             opts.set_uds(self.uds)
         if self.fd:
@@ -54,9 +53,7 @@ class Config:
 
     def options(self):
         opts = qs.Options(self.app)
-        # opts.set_bind_options(self.bind_options)
-        opts.set_port(self.port)
-        opts.set_host(self.host)
+        opts.set_hostport(self.host, self.port)
         if self.uds:
             opts.set_uds(self.uds)
         if self.fd:
