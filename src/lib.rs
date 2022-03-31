@@ -239,6 +239,7 @@ impl AsyncWrite for Connection {
 pub struct Acceptor(Option<tokio_native_tls::TlsAcceptor>);
 
 impl Acceptor {
+    #[inline]
     async fn accept(&self, stream: TcpStream) -> anyhow::Result<Connection> {
         Ok(if let Some(ref acceptor) = self.0 {
             Connection::TlsStream(acceptor.accept(stream).await?)
@@ -251,6 +252,7 @@ impl Acceptor {
 type PinnedDynSocketStream =
     Pin<Box<dyn Stream<Item = std::io::Result<(TcpStream, SocketAddr)>> + Send>>;
 
+#[inline]
 async fn bind(
     opts: &Options,
 ) -> anyhow::Result<stream::StreamMap<SocketAddr, PinnedDynSocketStream>> {
@@ -302,11 +304,14 @@ async fn bind(
     Ok(map)
 }
 
+#[inline]
 async fn serve(
     subsys: SubsystemHandle,
     locals: pyo3_asyncio::TaskLocals,
     mut opts: Options,
 ) -> anyhow::Result<()> {
+    // TODO: lifespan here
+
     let mut listeners = bind(&opts).await?;
 
     let acceptor = if let Some(pkcs12) = opts.pkcs12.take() {
@@ -332,7 +337,7 @@ async fn serve(
 
     let mut http = Http::new();
     http.http1_preserve_header_case(true);
-    http.http1_keep_alive(false);
+    // http.http1_keep_alive(false);
     http.pipeline_flush(true);
 
     // let mut futures = vec![];
@@ -361,11 +366,12 @@ async fn serve(
             app: opts.app.clone(),
             locals: locals.clone(),
         };
-        log::info!("accept connection from {}", remote_addr);
+        log::trace!("accept connection from {}", remote_addr);
         subsys.start("accept-connection", |subsys| conn_accepted.handle(subsys));
     }
     subsys.perform_partial_shutdown(nested).await.ok();
     // check
+    // lifespan here
     Ok(())
 }
 
@@ -381,6 +387,7 @@ struct ConnAccepted {
 }
 
 impl ConnAccepted {
+    #[inline]
     async fn handle(self, _subsys: SubsystemHandle) -> anyhow::Result<()> {
         // Accept the TLS connection.
         let conn = self
@@ -400,9 +407,16 @@ impl ConnAccepted {
                     let ctx = asgi::Context::new(locals, begin, self.local_addr, self.remote_addr);
                     let asgi = asgi::Asgi::new(app, ctx, opts);
                     asgi.serve(req).await
+                    // let body = hyper::body::Body::empty();
+                    // Ok::<hyper::Response<hyper::Body>, anyhow::Error>(hyper::Response::new(body))
                 })
             }
         });
+        // let service = service_fn(|_| async {
+        //     Ok::<hyper::Response<hyper::Body>, anyhow::Error>(hyper::Response::new(
+        //         hyper::Body::from("Hello World"),
+        //     ))
+        // });
         // In a loop, read data from the socket and write the data back.
         if let Err(err) = self.http.serve_connection(conn, service).await {
             log::warn!("Error while serving HTTP connection: {}", err);
@@ -411,12 +425,14 @@ impl ConnAccepted {
     }
 }
 
+#[inline]
 async fn shutingdown(subsys: SubsystemHandle) -> anyhow::Result<()> {
     SHUTDOWN.notified().await;
     subsys.request_shutdown();
     Ok(())
 }
 
+#[inline]
 async fn graceful(locals: TaskLocals, opts: Options) -> PyResult<()> {
     let handle = Toplevel::new()
         .start("serving", |subsys| serve(subsys.clone(), locals, opts))
@@ -446,7 +462,7 @@ fn run<'p>(py: Python<'p>, opts: PyRef<Options>) -> PyResult<&'p PyAny> {
 
     pyo3_asyncio::tokio::init(builder);
 
-    let locals = Python::with_gil(|py| pyo3_asyncio::tokio::get_current_locals(py))?;
+    let locals = pyo3_asyncio::tokio::get_current_locals(py)?;
 
     pyo3_asyncio::tokio::future_into_py(py, graceful(locals, opts)).into()
 }
@@ -454,10 +470,10 @@ fn run<'p>(py: Python<'p>, opts: PyRef<Options>) -> PyResult<&'p PyAny> {
 /// A Python module implemented in Rust.
 #[pymodule]
 fn quanshu(py: Python, m: &PyModule) -> PyResult<()> {
-    let logger = pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)?;
-    logger
-        .install()
-        .map_err(|err| PyErr::new::<PyException, _>(format!("Cannot set Logger {}", err)))?;
+    // let logger = pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)?;
+    // logger
+    //     .install()
+    //     .map_err(|err| PyErr::new::<PyException, _>(format!("Cannot set Logger {}", err)))?;
 
     m.add_class::<Options>()?;
     m.add_function(wrap_pyfunction!(run, m)?)?;

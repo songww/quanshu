@@ -1,15 +1,16 @@
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
+use hyper::{
+    body::{Buf, HttpBody},
+    Body as HyperBody, Request as HyperRequest,
+};
 use pyo3::{
     exceptions::{PyException, PyKeyError, PyValueError},
     prelude::*,
     types::{IntoPyDict, PyBytes, PyDict, PyList, PySequence, PyString},
 };
 use pyo3_asyncio::TaskLocals;
-use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender},
-    Mutex,
-};
+use tokio::sync::{mpsc::UnboundedSender, Mutex};
 
 #[non_exhaustive]
 #[derive(Clone)]
@@ -21,12 +22,14 @@ pub enum SpecVersion {
 }
 
 impl Default for SpecVersion {
+    #[inline]
     fn default() -> Self {
         SpecVersion::V2_3
     }
 }
 
 impl AsRef<str> for SpecVersion {
+    #[inline]
     fn as_ref(&self) -> &'static str {
         match self {
             SpecVersion::V2_0 => "2.0",
@@ -39,6 +42,7 @@ impl AsRef<str> for SpecVersion {
 }
 
 impl ToPyObject for SpecVersion {
+    #[inline]
     fn to_object(&self, py: Python) -> PyObject {
         self.as_ref().to_object(py)
     }
@@ -52,12 +56,14 @@ pub enum AsgiVersion {
 }
 
 impl Default for AsgiVersion {
+    #[inline]
     fn default() -> Self {
         AsgiVersion::V3
     }
 }
 
 impl AsRef<str> for AsgiVersion {
+    #[inline]
     fn as_ref(&self) -> &str {
         match self {
             AsgiVersion::V2 => "2.0",
@@ -68,6 +74,7 @@ impl AsRef<str> for AsgiVersion {
 }
 
 impl ToPyObject for AsgiVersion {
+    #[inline]
     fn to_object(&self, py: Python) -> PyObject {
         self.as_ref().to_object(py)
     }
@@ -91,10 +98,12 @@ pub enum Type {
 }
 
 impl Type {
+    #[inline]
     fn as_str(&self) -> &str {
         self.as_ref()
     }
 
+    #[inline]
     fn is_websocket(&self) -> bool {
         matches!(
             self,
@@ -110,12 +119,14 @@ impl Type {
 }
 
 impl ToPyObject for Type {
+    #[inline]
     fn to_object(&self, py: Python) -> PyObject {
         self.as_str().to_object(py)
     }
 }
 
 impl AsRef<str> for Type {
+    #[inline]
     fn as_ref(&self) -> &'static str {
         match self {
             Type::Http => "http",
@@ -138,6 +149,7 @@ impl AsRef<str> for Type {
 impl FromStr for Type {
     type Err = &'static str;
 
+    #[inline]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let t = match s {
             "http" => Type::Http,
@@ -160,6 +172,7 @@ impl FromStr for Type {
 }
 
 impl<'source> FromPyObject<'source> for Type {
+    #[inline]
     fn extract(obj: &'source PyAny) -> PyResult<Type> {
         //
         let s: &PyString = obj.downcast()?;
@@ -176,6 +189,7 @@ pub enum HttpVersion {
 }
 
 impl AsRef<str> for HttpVersion {
+    #[inline]
     fn as_ref(&self) -> &'static str {
         match self {
             HttpVersion::V1_0 => "1.0",
@@ -187,6 +201,7 @@ impl AsRef<str> for HttpVersion {
 }
 
 impl From<hyper::Version> for HttpVersion {
+    #[inline]
     fn from(v: hyper::Version) -> Self {
         match v {
             hyper::Version::HTTP_10 => HttpVersion::V1_0,
@@ -198,6 +213,7 @@ impl From<hyper::Version> for HttpVersion {
 }
 
 impl ToPyObject for HttpVersion {
+    #[inline]
     fn to_object(&self, py: Python) -> PyObject {
         self.as_ref().to_object(py)
     }
@@ -210,6 +226,7 @@ pub struct Asgi {
 }
 
 impl IntoPyDict for Asgi {
+    #[inline]
     fn into_py_dict(self, py: Python) -> &PyDict {
         let dict = PyDict::new(py);
         dict.set_item("version", self.version).unwrap();
@@ -255,6 +272,7 @@ pub struct Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
+    #[inline]
     pub fn new<HV: Into<HttpVersion>>(
         type_: Type,
         asgi: Asgi,
@@ -292,6 +310,7 @@ impl<'a> Scope<'a> {
 }
 
 impl IntoPyDict for Scope<'_> {
+    #[inline]
     fn into_py_dict(self, py: Python<'_>) -> &'_ PyDict {
         let dict = PyDict::new(py);
         dict.set_item("type", self.type_).unwrap();
@@ -377,6 +396,7 @@ pub enum Receive {
 }
 
 impl IntoPy<Py<PyAny>> for Receive {
+    #[inline]
     fn into_py(self, py: Python) -> Py<PyAny> {
         let d = PyDict::new(py);
         match self {
@@ -470,11 +490,13 @@ pub struct Sender {
 }
 
 impl Sender {
+    #[inline]
     pub fn new(locals: TaskLocals, tx: UnboundedSender<Send>) -> Sender {
         Sender { locals, inner: tx }
     }
 }
 
+#[inline]
 fn parse_headers(headers: &PyAny) -> PyResult<Vec<(Vec<u8>, Vec<u8>)>> {
     headers
         .iter()?
@@ -558,30 +580,60 @@ impl Sender {
 }
 
 #[pyclass]
-pub struct Receiver {
+pub struct RequestReceiver {
     locals: TaskLocals,
-    rx: Arc<Mutex<UnboundedReceiver<Receive>>>,
+    request: Arc<Mutex<HyperRequest<HyperBody>>>,
+    // request: HyperRequest<HyperBody>,
 }
 
-impl Receiver {
-    pub fn new(locals: TaskLocals, rx: UnboundedReceiver<Receive>) -> Receiver {
-        Receiver {
+impl RequestReceiver {
+    #[inline]
+    pub fn new(locals: TaskLocals, request: HyperRequest<HyperBody>) -> RequestReceiver {
+        RequestReceiver {
             locals,
-            rx: Arc::new(Mutex::new(rx)),
+            request: Arc::new(Mutex::new(request)),
+            // request,
         }
     }
 }
 
 #[pymethods]
-impl Receiver {
-    fn __call__<'a>(&'a self, py: Python<'a>) -> PyResult<&'a PyAny> {
-        let rx = self.rx.clone();
-        pyo3_asyncio::tokio::future_into_py_with_locals(py, self.locals.clone(), async move {
-            rx.lock()
-                .await
-                .recv()
-                .await
-                .ok_or_else(|| PyErr::new::<PyException, _>("Connection Closed"))
-        })
+impl RequestReceiver {
+    fn __call__<'py>(&'py self, py: Python<'py>) -> PyResult<&'py PyAny> {
+        let request = self.request.clone();
+        let future = async move {
+            // let mut recv = this.borrow_mut();
+            if let Some(buf) = request.lock().await.body_mut().data().await {
+                let mut buf = buf.map_err(|err| anyhow::anyhow!("{}", err))?;
+                unsafe {
+                    Python::with_gil_unchecked(|py| {
+                        let pybytes = PyBytes::new_with(py, buf.remaining(), |pybytes| {
+                            buf.copy_to_slice(pybytes);
+                            Ok(())
+                        })?;
+                        let req = PyDict::new(py);
+                        req.set_item("type", Type::HttpRequest)?;
+                        req.set_item("more_body", true)?;
+                        req.set_item("body", pybytes)?;
+                        Ok(req.to_object(py))
+                    })
+                }
+            } else {
+                unsafe {
+                    Python::with_gil_unchecked(|py| {
+                        let req = PyDict::new(py);
+                        req.set_item("type", Type::HttpRequest)?;
+                        req.set_item("more_body", false)?;
+                        req.set_item("body", PyBytes::new(py, &[]))?;
+                        Ok(req.to_object(py))
+                    })
+                }
+            }
+        };
+        // unsafe {
+        //     Python::with_gil_unchecked(|py| {
+        pyo3_asyncio::tokio::local_future_into_py_with_locals(py, self.locals.clone(), future)
+        // })
+        // }
     }
 }

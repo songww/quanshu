@@ -6,11 +6,11 @@ use futures::{sink::SinkExt, stream::StreamExt};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::http::response;
 use hyper::StatusCode;
-use hyper::{body::Buf, body::HttpBody, Body, Request, Response};
+use hyper::{Body, Request, Response};
 use hyper_tungstenite::tungstenite::Message;
 use hyper_tungstenite::HyperWebsocket;
 use pyo3::prelude::*;
-use pyo3::types::IntoPyDict;
+use pyo3::types::{IntoPyDict, PyDict};
 use pyo3_asyncio::tokio::scope as scope_future;
 use pyo3_asyncio::TaskLocals;
 use tokio::select;
@@ -29,6 +29,7 @@ pub(crate) struct Context {
 }
 
 impl Context {
+    #[inline]
     pub(crate) fn new(
         locals: TaskLocals,
         begin: Instant,
@@ -51,10 +52,12 @@ pub(crate) struct Asgi {
 }
 
 impl Asgi {
+    #[inline]
     pub(crate) fn new(app: PyObject, ctx: Context, opts: Options) -> Asgi {
         Asgi { ctx, app, opts }
     }
 
+    #[inline]
     pub(crate) async fn serve(&self, request: Request<Body>) -> anyhow::Result<Response<Body>> {
         if hyper_tungstenite::is_upgrade_request(&request) {
             let (response, websocket) = hyper_tungstenite::upgrade(request, None)?;
@@ -75,7 +78,8 @@ impl Asgi {
     }
 
     // Handle regular HTTP requests here.
-    async fn serve_httpx(&self, mut request: Request<Body>) -> anyhow::Result<Response<Body>> {
+    #[inline]
+    async fn serve_httpx(&self, request: Request<Body>) -> anyhow::Result<Response<Body>> {
         let uri = request.uri().clone();
         let request_headers = request.headers();
         let mut headers: Vec<_> = request_headers
@@ -94,6 +98,8 @@ impl Asgi {
             .filter(|conn| conn.as_bytes() == b"close".as_slice())
             .is_some();
 
+        drop(request_headers);
+
         let scope = specs::Scope::new(
             specs::Type::Http,
             specs::Asgi::default(),
@@ -111,41 +117,27 @@ impl Asgi {
 
         let locals = self.ctx.locals.clone();
 
-        let (req_tx, rx) = unbounded();
-
         let (tx, mut resp_rx) = unbounded();
 
-        let fut = pyo3::Python::with_gil(|py| -> PyResult<_> {
-            let receive = Py::new(py, specs::Receiver::new(locals.clone(), rx))?;
-            let send = Py::new(py, specs::Sender::new(locals.clone(), tx))?;
-            let coro = self
-                .app
-                .call1(py, (scope.into_py_dict(py), receive, send))?;
+        let scope: Py<PyDict> = pyo3::Python::with_gil(|py| scope.into_py_dict(py).into_py(py));
+
+        let send = specs::Sender::new(locals.clone(), tx);
+        let receive = specs::RequestReceiver::new(locals.clone(), request);
+
+        let task = pyo3::Python::with_gil(|py| -> PyResult<_> {
+            // let scope = scope.into_py_dict(py);
             let el = self.ctx.locals.event_loop(py);
+            let coro = self.app.as_ref(py).call1((scope, receive, send))?;
             let task = el.call_method1("create_task", (coro,))?;
-            pyo3_asyncio::tokio::into_future(task)
+            pyo3_asyncio::into_future_with_locals(&locals, task)
         })?;
-        let _app_process = tokio::spawn(scope_future(self.ctx.locals.clone(), fut));
-        while let Some(buf) = request.body_mut().data().await {
-            let buf = buf?;
-            while buf.has_remaining() {
-                let chunk = buf.chunk();
-                req_tx.send(specs::Receive::HttpRequest {
-                    body: chunk.to_vec(),
-                    more_body: true,
-                })?;
-            }
-        }
-        req_tx.send(specs::Receive::HttpRequest {
-            body: vec![],
-            more_body: false,
-        })?;
+        let _app_processing = tokio::task::spawn(task);
 
         log::trace!("waiting resp");
         let head = resp_rx.recv().await;
         log::trace!("waiting resp..");
         // let mut response_builder = Response::builder();
-        let http_version = request.version();
+        // let http_version = request.version();
         let (mut body_sender, body) = Body::channel();
         let mut resp = response::Response::new(body);
         if let Some(specs::Send::ResponseStart {
@@ -173,10 +165,10 @@ impl Asgi {
         }
 
         let access_log = self.opts.access_log;
-        let remote_addr = self.ctx.remote_addr;
-        let method = request.method().clone();
-        let uri = uri.path_and_query().unwrap().clone();
-        let begin = self.ctx.begin;
+        // let remote_addr = self.ctx.remote_addr;
+        // let method = request.method().clone();
+        // let uri = uri.path_and_query().unwrap().clone();
+        // let begin = self.ctx.begin;
 
         log::trace!("waiting resp body");
         if let Some(specs::Send::ResponseBody {
@@ -187,7 +179,7 @@ impl Asgi {
         {
             if !more_body {
                 *resp.body_mut() = chunk.into();
-                crate::access::log(remote_addr, method, uri, http_version, resp.status(), begin);
+                // crate::access::log(remote_addr, method, uri, http_version, resp.status(), begin);
                 return Ok(resp);
             }
             body_sender.send_data(chunk.into()).await?;
@@ -195,7 +187,7 @@ impl Asgi {
             anyhow::bail!("ResponseBody required!")
         }
 
-        let status = resp.status();
+        // let status = resp.status();
         let _further = tokio::spawn(async move {
             while let Some(specs::Send::ResponseBody {
                 type_: _,
@@ -213,13 +205,14 @@ impl Asgi {
                 }
             }
             if access_log {
-                crate::access::log(remote_addr, method, uri, http_version, status, begin);
+                // crate::access::log(remote_addr, method, uri, http_version, status, begin);
             }
         });
         Ok(resp)
     }
 }
 
+#[inline]
 /// Handle a websocket connection.
 async fn serve_websocket(_ctx: Context, websocket: HyperWebsocket) -> anyhow::Result<()> {
     let mut websocket = websocket.await?;
