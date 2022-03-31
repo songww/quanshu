@@ -64,6 +64,7 @@ class Config:
             opts.set_certfile(self.ssl_certfile, self.ssl_key_password)
         if self.root_path:
             opts.set_root_path(self.root_path)
+        opts.enable_access_log(self.access_log)
         opts.enable_date_header(self.date_header)
         opts.enable_server_header(self.server_header)
         opts.enable_proxy_headers(self.proxy_headers)

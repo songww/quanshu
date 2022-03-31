@@ -1,3 +1,4 @@
+mod access;
 mod asgi;
 
 use std::net::SocketAddr;
@@ -16,6 +17,7 @@ use pyo3_asyncio::TaskLocals;
 use stream::{Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Instant;
 use tokio_graceful_shutdown::{SubsystemHandle, Toplevel};
 use tokio_native_tls::native_tls::{Identity, TlsAcceptor};
 use tokio_native_tls::TlsStream;
@@ -42,6 +44,7 @@ struct Options {
     date_header_enabled: bool,
     server_header_enabled: bool,
     proxy_headers_enabled: bool,
+    access_log: bool,
 }
 
 #[pymethods]
@@ -94,6 +97,7 @@ impl Options {
             date_header_enabled: true,
             server_header_enabled: true,
             proxy_headers_enabled: true,
+            access_log: true,
         })
     }
 
@@ -129,6 +133,11 @@ impl Options {
     fn set_fd(&mut self, fd: RawFd) {
         self.fd.replace(fd);
     }
+
+    fn enable_access_log(&mut self, enable: bool) {
+        self.access_log = enable;
+    }
+
     fn set_workers(&mut self, workers: usize) {
         self.workers.replace(workers);
     }
@@ -380,13 +389,15 @@ impl ConnAccepted {
             .await
             .expect("Accept failed");
 
+        let begin = Instant::now();
+
         let service = service_fn({
             move |req| {
                 let app = self.app.clone();
                 let opts = self.opts.clone();
                 let locals = self.locals.clone();
                 pyo3_asyncio::tokio::scope(locals.clone(), async move {
-                    let ctx = asgi::Context::new(locals, self.local_addr, self.remote_addr);
+                    let ctx = asgi::Context::new(locals, begin, self.local_addr, self.remote_addr);
                     let asgi = asgi::Asgi::new(app, ctx, opts);
                     asgi.serve(req).await
                 })
@@ -394,7 +405,7 @@ impl ConnAccepted {
         });
         // In a loop, read data from the socket and write the data back.
         if let Err(err) = self.http.serve_connection(conn, service).await {
-            log::trace!("Error while serving HTTP connection: {}", err);
+            log::warn!("Error while serving HTTP connection: {}", err);
         }
         Ok(())
     }
