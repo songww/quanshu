@@ -77,7 +77,7 @@ impl Asgi {
                 uri.scheme_str().unwrap_or("http"),
                 uri.path(),
                 None,
-                uri.query().unwrap_or("").as_bytes(),
+                uri.query().unwrap_or(""),
                 &self.opts.root_path,
                 &headers,
                 Some(self.ctx.remote_addr.into()),

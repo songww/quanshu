@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 use pyo3::{
     exceptions::{PyException, PyKeyError, PyValueError},
     prelude::*,
-    types::{IntoPyDict, PyDict, PyList, PySequence, PyString},
+    types::{IntoPyDict, PyBytes, PyDict, PyList, PySequence, PyString},
 };
 use pyo3_asyncio::TaskLocals;
 use tokio::sync::{
@@ -244,8 +244,8 @@ pub struct Scope<'a> {
     method: &'a str,
     scheme: &'a str,
     path: &'a str,
-    raw_path: Option<&'a [u8]>,
-    query_string: &'a [u8],
+    raw_path: Option<&'a str>,
+    query_string: &'a str,
     root_path: &'a str,
     headers: &'a [(&'a [u8], &'a [u8])],
     client: Option<SocketAddr>,
@@ -262,8 +262,8 @@ impl<'a> Scope<'a> {
         method: &'a str,
         scheme: &'a str,
         path: &'a str,
-        raw_path: Option<&'a [u8]>,
-        query_string: &'a [u8],
+        raw_path: Option<&'a str>,
+        query_string: &'a str,
         root_path: &'a str,
         headers: &'a [(&'a [u8], &'a [u8])],
         client: Option<SocketAddr>,
@@ -300,10 +300,22 @@ impl IntoPyDict for Scope<'_> {
         dict.set_item("method", self.method).unwrap();
         dict.set_item("scheme", self.scheme).unwrap();
         dict.set_item("path", self.path).unwrap();
-        dict.set_item("raw_path", self.raw_path).unwrap();
-        dict.set_item("query_string", self.query_string).unwrap();
+        if let Some(raw_path) = self.raw_path {
+            dict.set_item("raw_path", PyBytes::new(py, raw_path.as_bytes()))
+                .unwrap();
+        } else {
+            dict.set_item("raw_path", py.None()).unwrap();
+        }
+        dict.set_item("query_string", self.query_string.as_bytes())
+            .unwrap();
         dict.set_item("root_path", self.root_path).unwrap();
-        dict.set_item("headers", self.headers).unwrap();
+        let headers = PyList::new(
+            py,
+            self.headers
+                .iter()
+                .map(|(k, v)| (PyBytes::new(py, k), PyBytes::new(py, v))),
+        );
+        dict.set_item("headers", headers).unwrap();
 
         dict.set_item("client", {
             if let Some(ref addr) = self.client {
@@ -373,7 +385,6 @@ impl IntoPy<Py<PyAny>> for Receive {
                 body,
                 more_body,
             } => {
-                // d.set_item("type", type_.as_ref());
                 d.set_item("type", Type::HttpRequest).unwrap();
                 d.set_item("body", body).unwrap();
                 d.set_item("more_body", more_body).unwrap();
@@ -387,7 +398,7 @@ impl IntoPy<Py<PyAny>> for Receive {
             Receive::WebsocketReceive { bytes, text } => {
                 d.set_item("type", Type::WebsocketReceive).unwrap();
                 if let Some(bytes) = bytes {
-                    d.set_item("bytes", bytes).unwrap();
+                    d.set_item("bytes", PyBytes::new(py, &bytes)).unwrap();
                 }
                 if let Some(text) = text {
                     d.set_item("text", text).unwrap();

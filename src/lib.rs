@@ -2,15 +2,17 @@ mod asgi;
 
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
+#[cfg(unix)]
+use std::os::unix::prelude::FromRawFd;
+#[cfg(windows)]
+use std::os::windows::prelude::FromRawSocket;
 use std::pin::Pin;
 
-// use futures::stream::Stream as _;
 use hyper::{server::conn::Http, service::service_fn};
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use pyo3_asyncio::TaskLocals;
-// use stream::Stream as _Stream;
 use stream::{Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -237,31 +239,56 @@ impl Acceptor {
     }
 }
 
+type PinnedDynSocketStream =
+    Pin<Box<dyn Stream<Item = std::io::Result<(TcpStream, SocketAddr)>> + Send>>;
+
 async fn bind(
     opts: &Options,
-) -> anyhow::Result<
-    stream::StreamMap<SocketAddr, impl Stream<Item = std::io::Result<(TcpStream, SocketAddr)>>>,
-> {
+) -> anyhow::Result<stream::StreamMap<SocketAddr, PinnedDynSocketStream>> {
+    let defautl_addr = opts.addrs[0];
     let mut map = stream::StreamMap::with_capacity(opts.addrs.len());
-    for addr in opts.addrs.iter() {
-        let domain = socket2::Domain::for_address(*addr);
-        let typ = socket2::Type::STREAM.nonblocking();
-        let socket = socket2::Socket::new(domain, typ, Some(socket2::Protocol::TCP))?;
+    if let Some(fd) = opts.fd {
+        #[cfg(unix)]
+        let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
+        #[cfg(windows)]
+        let socket = unsafe { socket2::Socket::from_raw_socket(fd) };
         socket.set_only_v6(false).ok();
         socket.set_reuse_port(true)?;
         socket.set_reuse_address(true)?;
-        socket.bind(&(*addr).into())?;
         socket.set_nonblocking(true)?;
         socket.listen(4096)?;
 
         let listener = TcpListener::from_std(socket.into())?;
-        let stream = async_stream::try_stream! {
+        let stream = Box::pin(async_stream::try_stream! {
             loop {
                 yield listener.accept().await?;
             }
-        }; // as Pin<Box<dyn stream::Stream<Item = (Stream, SocketAddr)>>>;
-        map.insert(*addr, Box::pin(stream));
-        log::info!("quanshu listening on {}", addr);
+        }) as PinnedDynSocketStream;
+        map.insert(defautl_addr, stream);
+    }
+    if let Some(ref uds) = opts.uds {
+        unimplemented!()
+    } else {
+        for addr in opts.addrs.iter() {
+            let domain = socket2::Domain::for_address(*addr);
+            let typ = socket2::Type::STREAM.nonblocking();
+            let socket = socket2::Socket::new(domain, typ, Some(socket2::Protocol::TCP))?;
+            socket.set_only_v6(false).ok();
+            socket.set_reuse_port(true)?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&(*addr).into())?;
+            socket.set_nonblocking(true)?;
+            socket.listen(4096)?;
+
+            let listener = TcpListener::from_std(socket.into())?;
+            let stream = Box::pin(async_stream::try_stream! {
+                loop {
+                    yield listener.accept().await?;
+                }
+            }) as PinnedDynSocketStream;
+            map.insert(*addr, stream);
+            log::info!("quanshu listening on {}", addr);
+        }
     }
     Ok(map)
 }
