@@ -7,12 +7,15 @@ use std::net::ToSocketAddrs;
 use std::os::unix::prelude::FromRawFd;
 #[cfg(windows)]
 use std::os::windows::prelude::FromRawSocket;
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::str::FromStr;
 
+use hyper::header::HeaderName;
+use hyper::header::HeaderValue;
 use hyper::{server::conn::Http, service::service_fn};
-use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyString;
 use pyo3_asyncio::TaskLocals;
 use stream::{Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -30,76 +33,150 @@ type RawFd = std::os::windows::io::RawSocket;
 
 static SHUTDOWN: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
+static PYAPPWRAPPING: &str = "
+async def wraps(app, scope, receive, send):
+    return await app(scope, receive, send)
+";
+
+fn to_socket_addrs(addr: &str) -> std::io::Result<Vec<SocketAddr>> {
+    addr.to_socket_addrs().map(|iter| iter.collect())
+}
+
+fn try_parse_header(header: &str) -> anyhow::Result<(HeaderName, HeaderValue)> {
+    if let Some((k, v)) = header.split_once(":") {
+        Ok((HeaderName::from_str(k)?, HeaderValue::from_str(v)?))
+    } else {
+        anyhow::bail!("Invalid header ")
+    }
+}
+
+fn try_import_app(s: &str) -> anyhow::Result<PyObject> {
+    Python::with_gil(|py| -> anyhow::Result<PyObject> {
+        let (module, attrs) = s.split_once(":").ok_or_else(|| {
+            anyhow::anyhow!(
+                "app string '{}' must be in format '<module>:<attribute>'.",
+                s
+            )
+        })?;
+        let pymodule = py.import(module)?;
+        let mut pyapp = pymodule.as_ref();
+        for attr in attrs.split(".") {
+            pyapp = pyapp.getattr(attr)?
+        }
+        if !pyapp.is_callable() {
+            anyhow::bail!("app '{}' is not callable!", s);
+        }
+        let wraps = PyModule::from_code(py, PYAPPWRAPPING, "py_app_wrapper.py", "py_app_wrapper")
+            .unwrap()
+            .getattr("wraps")
+            .unwrap();
+
+        let partial = py.import("functools").unwrap().getattr("partial").unwrap();
+        let locals = pyo3::types::PyDict::new(py);
+        locals.set_item("app", pyapp).unwrap();
+        locals.set_item("wraps", wraps).unwrap();
+        locals.set_item("partial", partial).unwrap();
+        let pyapp = py.eval("partial(wraps, app)", None, Some(locals)).unwrap();
+        println!("py app {}", pyapp);
+
+        Ok(pyapp.to_object(py))
+    })
+}
+
+type SocketAddrs = Vec<SocketAddr>;
+
 #[pyclass]
-#[derive(Clone)]
-struct Options {
+#[derive(Clone, Debug, clap::Parser)]
+#[clap(author, version, about, long_about = None)]
+pub struct Options {
+    #[clap(parse(try_from_str = try_import_app))]
     app: PyObject,
-    addrs: Vec<SocketAddr>,
-    uds: Option<String>,
+    /// Bind to this
+    #[clap(
+        name = "bind",
+        short = 'b',
+        long = "bind",
+        parse(try_from_str = to_socket_addrs),
+        default_value = "127.0.0.1:8000",
+        value_name = "ADDRESS"
+    )]
+    addrs: SocketAddrs,
+    #[clap(long)]
+    uds: Option<PathBuf>,
+    #[clap(long)]
     fd: Option<RawFd>,
-    pkcs12: Option<Identity>,
-    headers: Vec<(String, String)>,
+    #[clap(long)]
+    // pkcs12: Option<Identity>,
+    pkcs12: Option<PathBuf>,
+    #[clap(short = 'H', long, parse(try_from_str = try_parse_header))]
+    headers: Vec<(HeaderName, HeaderValue)>,
+    #[clap(short, long)]
     workers: Option<usize>,
+    #[clap(short, long, default_value = "")]
     root_path: String,
-    date_header_enabled: bool,
-    server_header_enabled: bool,
-    proxy_headers_enabled: bool,
+    // #[clap(short, long, default_value = "")]
+    // date_header_enabled: bool,
+    // server_header_enabled: bool,
+    // proxy_headers_enabled: bool,
+    #[clap(short, long, parse(from_occurrences))]
+    verbose: usize,
+    #[clap(skip)]
     access_log: bool,
 }
 
 #[pymethods]
 impl Options {
-    #[new]
-    fn new(py: Python, app: &PyAny) -> PyResult<Options> {
-        if app.is_none() {
-            return Err(PyErr::new::<PyTypeError, _>(
-                "Invalid app type, string or callable object expected.",
-            ));
-        }
-        let app = {
-            if app.is_instance_of::<PyString>()? {
-                let s = app.cast_as::<PyString>()?.to_str()?;
-                let (module, attrs) = s.split_once(":").ok_or_else(|| {
-                    PyErr::new::<PyValueError, _>(format!(
-                        "app string '{}' must be in format '<module>:<attribute>'.",
-                        s
-                    ))
-                })?;
-                let mut instance = py.import(&module)?.as_ref();
-                for attr in attrs.split(".") {
-                    instance = instance.getattr(attr)?
-                }
-                if !instance.is_callable() {
-                    return Err(PyErr::new::<PyValueError, _>(format!(
-                        "app '{}' is not callable!",
-                        s
-                    )));
-                }
-                instance
-            } else if !app.is_callable() {
-                return Err(PyErr::new::<PyValueError, _>(format!(
-                    "app '{}' is not callable!",
-                    app
-                )));
-            } else {
-                app
-            }
-        };
-        Ok(Options {
-            app: app.to_object(py),
-            addrs: "localhost:8000".to_socket_addrs()?.collect(),
-            uds: None,
-            fd: None,
-            pkcs12: None,
-            headers: Vec::new(),
-            workers: None,
-            root_path: String::new(),
-            date_header_enabled: true,
-            server_header_enabled: true,
-            proxy_headers_enabled: true,
-            access_log: true,
-        })
-    }
+    // #[new]
+    // fn new(py: Python, app: &PyAny) -> PyResult<Options> {
+    //     if app.is_none() {
+    //         return Err(PyErr::new::<PyTypeError, _>(
+    //             "Invalid app type, string or callable object expected.",
+    //         ));
+    //     }
+    //     let app = {
+    //         if app.is_instance_of::<PyString>()? {
+    //             let s = app.cast_as::<PyString>()?.to_str()?;
+    //             let (module, attrs) = s.split_once(":").ok_or_else(|| {
+    //                 PyErr::new::<PyValueError, _>(format!(
+    //                     "app string '{}' must be in format '<module>:<attribute>'.",
+    //                     s
+    //                 ))
+    //             })?;
+    //             let mut instance = py.import(&module)?.as_ref();
+    //             for attr in attrs.split(".") {
+    //                 instance = instance.getattr(attr)?
+    //             }
+    //             if !instance.is_callable() {
+    //                 return Err(PyErr::new::<PyValueError, _>(format!(
+    //                     "app '{}' is not callable!",
+    //                     s
+    //                 )));
+    //             }
+    //             instance
+    //         } else if !app.is_callable() {
+    //             return Err(PyErr::new::<PyValueError, _>(format!(
+    //                 "app '{}' is not callable!",
+    //                 app
+    //             )));
+    //         } else {
+    //             app
+    //         }
+    //     };
+    //     Ok(Options {
+    //         app: app.to_object(py),
+    //         addrs: "localhost:8000".to_socket_addrs()?.collect(),
+    //         uds: None,
+    //         fd: None,
+    //         // pkcs12: None,
+    //         headers: Vec::new(),
+    //         workers: None,
+    //         root_path: String::new(),
+    //         // date_header_enabled: true,
+    //         // server_header_enabled: true,
+    //         // proxy_headers_enabled: true,
+    //         // access_log: true,
+    //     })
+    // }
 
     /// default is "127.0.0.1"
     fn set_hostport(&mut self, host: &str, port: u16) -> PyResult<()> {
@@ -124,6 +201,7 @@ impl Options {
         Ok(())
     }
 
+    /*
     /// Bind to a UNIX domain socket.
     /// eg: `/tmp/quanshu.sock`
     fn set_uds(&mut self, uds: String) {
@@ -182,6 +260,7 @@ impl Options {
     fn set_root_path(&mut self, root_path: String) {
         self.root_path = root_path;
     }
+    */
 }
 
 enum Connection {
@@ -256,6 +335,7 @@ type PinnedDynSocketStream =
 async fn bind(
     opts: &Options,
 ) -> anyhow::Result<stream::StreamMap<SocketAddr, PinnedDynSocketStream>> {
+    let mut listening = vec![];
     let defautl_addr = opts.addrs[0];
     let mut map = stream::StreamMap::with_capacity(opts.addrs.len());
     if let Some(fd) = opts.fd {
@@ -270,6 +350,7 @@ async fn bind(
         socket.listen(4096)?;
 
         let listener = TcpListener::from_std(socket.into())?;
+        listening.push(listener.local_addr().unwrap());
         let stream = Box::pin(async_stream::try_stream! {
             loop {
                 yield listener.accept().await?;
@@ -292,6 +373,7 @@ async fn bind(
             socket.listen(4096)?;
 
             let listener = TcpListener::from_std(socket.into())?;
+            listening.push(listener.local_addr().unwrap());
             let stream = Box::pin(async_stream::try_stream! {
                 loop {
                     yield listener.accept().await?;
@@ -301,8 +383,19 @@ async fn bind(
             log::info!("quanshu listening on {}", addr);
         }
     }
+    println!("Started http server: {:?}", &listening);
     Ok(map)
 }
+
+/*
+async fn serve(
+    subsys: SubsystemHandle,
+    locals: pyo3_asyncio::TaskLocals,
+    opts: Options,
+) -> anyhow::Result<()> {
+    unimplemented!()
+}
+*/
 
 #[inline]
 async fn serve(
@@ -315,8 +408,10 @@ async fn serve(
     let mut listeners = bind(&opts).await?;
 
     let acceptor = if let Some(pkcs12) = opts.pkcs12.take() {
+        let der = tokio::fs::read(&pkcs12).await?;
+        let identity = Identity::from_pkcs12(&der, "")?;
         Acceptor(Some(tokio_native_tls::TlsAcceptor::from(
-            TlsAcceptor::builder(pkcs12).build().map_err(|err| {
+            TlsAcceptor::builder(identity).build().map_err(|err| {
                 PyErr::new::<PyValueError, _>(format!("Unsupported certificate {}", err))
             })?,
         )))
@@ -324,16 +419,16 @@ async fn serve(
         Acceptor(None)
     };
 
-    if opts.server_header_enabled
-        && opts
-            .headers
-            .iter()
-            .find(|(k, _)| k.to_lowercase() == "server")
-            .is_none()
-    {
-        opts.headers
-            .push(("Server".to_string(), "quanshu".to_string()));
-    }
+    // if opts.server_header_enabled
+    //     && opts
+    //         .headers
+    //         .iter()
+    //         .find(|(k, _)| k.to_lowercase() == "server")
+    //         .is_none()
+    // {
+    //     opts.headers
+    //         .push(("Server".to_string(), "quanshu".to_string()));
+    // }
 
     let mut http = Http::new();
     http.http1_preserve_header_case(true);
@@ -433,7 +528,7 @@ async fn shutingdown(subsys: SubsystemHandle) -> anyhow::Result<()> {
 }
 
 #[inline]
-async fn graceful(locals: TaskLocals, opts: Options) -> PyResult<()> {
+pub async fn graceful(locals: TaskLocals, opts: Options) -> PyResult<()> {
     let handle = Toplevel::new()
         .start("serving", |subsys| serve(subsys.clone(), locals, opts))
         .catch_signals()

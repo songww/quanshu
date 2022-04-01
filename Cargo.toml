@@ -6,7 +6,7 @@ edition = "2021"
 
 [lib]
 name = "quanshu"
-crate-type = ["cdylib"]
+# crate-type = ["cdylib"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -20,9 +20,9 @@ tokio-native-tls = "0.3"
 hyper-tungstenite = "0.6"
 tokio-graceful-shutdown = "0.5"
 
-# [dependencies.clap]
-# version = "3"
-# features = ["debug", "derive", "yaml", "env"]
+[dependencies.clap]
+version = "3"
+features = ["debug", "derive", "yaml", "env"]
 
 [dependencies.tokio]
 version = "1"
@@ -38,7 +38,7 @@ features = ["tcp", "runtime", "server", "stream", "http1", "http2"]
 
 [dependencies.pyo3]
 version = "0.16"
-features = ["auto-initialize", "extension-module", "anyhow"]
+features = ["auto-initialize", "anyhow"]
 
 [dependencies.pyo3-asyncio]
 version = "0.16"

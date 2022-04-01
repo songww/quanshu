@@ -2,6 +2,7 @@ mod specs;
 
 use std::net::SocketAddr;
 
+use futures::TryFutureExt;
 use futures::{sink::SinkExt, stream::StreamExt};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::http::response;
@@ -80,37 +81,39 @@ impl Asgi {
     // Handle regular HTTP requests here.
     #[inline]
     async fn serve_httpx(&self, request: Request<Body>) -> anyhow::Result<Response<Body>> {
-        let uri = request.uri().clone();
-        let request_headers = request.headers();
-        let mut headers: Vec<_> = request_headers
+        let (head, payload) = request.into_parts();
+        let uri = head.uri.clone();
+        let request_headers = head.headers;
+        let headers: Vec<_> = request_headers
             .iter()
             .filter(|(k, _)| !k.as_str().starts_with(':'))
-            .map(|(k, v)| (k.as_ref(), v.as_bytes()))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         if !request_headers.contains_key("Host") && request_headers.contains_key(":Authority") {
             let host = request_headers.get(":Authority").unwrap();
-            headers.push((b"Host".as_slice(), host.as_bytes()));
-            let last = headers.len();
-            headers.swap(0, last);
+            // headers.push((b"Host".as_slice(), host.as_bytes()));
+            // let last = headers.len();
+            // headers.swap(0, last);
+            println!("Host dose not exists.");
         };
         let connection_close = request_headers
             .get("Connection")
             .filter(|conn| conn.as_bytes() == b"close".as_slice())
             .is_some();
 
-        drop(request_headers);
-
         let scope = specs::Scope::new(
             specs::Type::Http,
             specs::Asgi::default(),
-            request.version(),
-            request.method().as_str(),
-            uri.scheme_str().unwrap_or("http"),
-            uri.path(),
+            head.version,
+            head.method.to_string(),
+            uri.scheme()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "http".to_string()),
+            uri.path().to_string(),
             None,
-            uri.query().unwrap_or(""),
-            &self.opts.root_path,
-            &headers,
+            uri.query().unwrap_or("").to_string(),
+            self.opts.root_path.clone(),
+            headers,
             Some(self.ctx.remote_addr.into()),
             self.ctx.local_addr.into(),
         );
@@ -119,10 +122,8 @@ impl Asgi {
 
         let (tx, mut resp_rx) = unbounded();
 
-        let scope: Py<PyDict> = pyo3::Python::with_gil(|py| scope.into_py_dict(py).into_py(py));
-
         let send = specs::Sender::new(locals.clone(), tx);
-        let receive = specs::RequestReceiver::new(locals.clone(), request);
+        let receive = specs::RequestReceiver::new(locals.clone(), payload);
 
         let task = pyo3::Python::with_gil(|py| -> PyResult<_> {
             // let scope = scope.into_py_dict(py);
@@ -130,15 +131,19 @@ impl Asgi {
             let coro = self.app.as_ref(py).call1((scope, receive, send))?;
             let task = el.call_method1("create_task", (coro,))?;
             pyo3_asyncio::into_future_with_locals(&locals, task)
-        })?;
-        let _app_processing = tokio::task::spawn(task);
+        })
+        .unwrap();
+        let _app_processing = tokio::task::spawn(task).and_then(|p| async move {
+            println!("app task done {:?}", p);
+            Ok(())
+        });
 
-        log::trace!("waiting resp");
+        // log::trace!("waiting resp");
         let head = resp_rx.recv().await;
-        log::trace!("waiting resp..");
-        // let mut response_builder = Response::builder();
+        // log::trace!("waiting resp..");
         // let http_version = request.version();
         let (mut body_sender, body) = Body::channel();
+        // body_sender.send_data("hello there!".into()).await.unwrap();
         let mut resp = response::Response::new(body);
         if let Some(specs::Send::ResponseStart {
             type_: _,
@@ -146,7 +151,7 @@ impl Asgi {
             headers,
         }) = head
         {
-            *resp.status_mut() = StatusCode::from_u16(status)?;
+            *resp.status_mut() = StatusCode::from_u16(status).unwrap();
             let headers_map = resp.headers_mut();
             for (k, v) in headers.iter() {
                 headers_map.append(HeaderName::from_bytes(&k)?, v.as_slice().try_into()?);
@@ -155,59 +160,59 @@ impl Asgi {
                 headers_map.append(HeaderName::try_from(k)?, v.try_into()?);
             }
         } else {
-            anyhow::bail!("ResponseStart required!");
+            // panic!("ResponseStart required {:?}!", head);
         };
-        if connection_close {
-            resp.headers_mut().insert(
-                HeaderName::from_static("connection"),
-                HeaderValue::from_static("close"),
-            );
-        }
-
-        let access_log = self.opts.access_log;
+        // if connection_close {
+        //     resp.headers_mut().insert(
+        //         HeaderName::from_static("connection"),
+        //         HeaderValue::from_static("close"),
+        //     );
+        // }
+        //
+        // let access_log = self.opts.access_log;
         // let remote_addr = self.ctx.remote_addr;
         // let method = request.method().clone();
         // let uri = uri.path_and_query().unwrap().clone();
         // let begin = self.ctx.begin;
 
-        log::trace!("waiting resp body");
+        // log::trace!("waiting resp body");
+        let message = resp_rx.recv().await;
         if let Some(specs::Send::ResponseBody {
             type_: _,
             body: chunk,
             more_body,
-        }) = resp_rx.recv().await
+        }) = message
         {
             if !more_body {
                 *resp.body_mut() = chunk.into();
-                // crate::access::log(remote_addr, method, uri, http_version, resp.status(), begin);
                 return Ok(resp);
             }
             body_sender.send_data(chunk.into()).await?;
         } else {
-            anyhow::bail!("ResponseBody required!")
+            panic!("ResponseBody required {:?}!", message)
         }
 
-        // let status = resp.status();
-        let _further = tokio::spawn(async move {
-            while let Some(specs::Send::ResponseBody {
-                type_: _,
-                body: chunk,
-                more_body,
-            }) = resp_rx.recv().await
-            {
-                log::trace!("waiting more resp body");
-                body_sender
-                    .send_data(chunk.into())
-                    .await
-                    .expect("Send response body failed");
-                if !more_body {
-                    break;
-                }
-            }
-            if access_log {
-                // crate::access::log(remote_addr, method, uri, http_version, status, begin);
-            }
-        });
+        // // let status = resp.status();
+        // let _further = tokio::spawn(async move {
+        //     while let Some(specs::Send::ResponseBody {
+        //         type_: _,
+        //         body: chunk,
+        //         more_body,
+        //     }) = resp_rx.recv().await
+        //     {
+        //         log::trace!("waiting more resp body");
+        //         body_sender
+        //             .send_data(chunk.into())
+        //             .await
+        //             .expect("Send response body failed");
+        //         if !more_body {
+        //             break;
+        //         }
+        //     }
+        //     if access_log {
+        //         // crate::access::log(remote_addr, method, uri, http_version, status, begin);
+        //     }
+        // });
         Ok(resp)
     }
 }

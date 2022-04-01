@@ -2,6 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
 use hyper::{
     body::{Buf, HttpBody},
+    header::{HeaderName, HeaderValue},
     Body as HyperBody, Request as HyperRequest,
 };
 use pyo3::{
@@ -219,10 +220,22 @@ impl ToPyObject for HttpVersion {
     }
 }
 
+#[pyclass]
 #[derive(Clone, Default)]
 pub struct Asgi {
     version: AsgiVersion,
     spec_version: SpecVersion,
+}
+
+#[pymethods]
+impl Asgi {
+    fn as_dict<'py>(&self, py: Python<'py>) -> &'py PyDict {
+        let dict = PyDict::new(py);
+        dict.set_item("version", self.version.as_ref()).unwrap();
+        dict.set_item("spec_version", self.spec_version.as_ref())
+            .unwrap();
+        dict
+    }
 }
 
 impl IntoPyDict for Asgi {
@@ -253,37 +266,38 @@ impl From<PathBuf> for ServerAddr {
     }
 }
 
+#[pyclass]
 #[derive(Clone)]
-pub struct Scope<'a> {
+pub struct Scope {
     type_: Type,
     asgi: Asgi,
     http_version: HttpVersion,
-    method: &'a str,
-    scheme: &'a str,
-    path: &'a str,
-    raw_path: Option<&'a str>,
-    query_string: &'a str,
-    root_path: &'a str,
-    headers: &'a [(&'a [u8], &'a [u8])],
+    method: String,
+    scheme: String,
+    path: String,
+    raw_path: Option<String>,
+    query_string: String,
+    root_path: String,
+    headers: Vec<(HeaderName, HeaderValue)>,
     client: Option<SocketAddr>,
     server: ServerAddr,
     // only for websocket
-    subprotocols: Option<&'a [&'a str]>,
+    subprotocols: Option<Vec<String>>,
 }
 
-impl<'a> Scope<'a> {
+impl Scope {
     #[inline]
     pub fn new<HV: Into<HttpVersion>>(
         type_: Type,
         asgi: Asgi,
         http_version: HV,
-        method: &'a str,
-        scheme: &'a str,
-        path: &'a str,
-        raw_path: Option<&'a str>,
-        query_string: &'a str,
-        root_path: &'a str,
-        headers: &'a [(&'a [u8], &'a [u8])],
+        method: String,
+        scheme: String,
+        path: String,
+        raw_path: Option<String>,
+        query_string: String,
+        root_path: String,
+        headers: Vec<(HeaderName, HeaderValue)>,
         client: Option<SocketAddr>,
         server: ServerAddr,
     ) -> Self {
@@ -304,12 +318,77 @@ impl<'a> Scope<'a> {
         }
     }
 
-    pub fn set_subprotocols(&mut self, subprotocols: &'a [&'a str]) {
+    pub fn set_subprotocols(&mut self, subprotocols: Vec<String>) {
         self.subprotocols.replace(subprotocols);
     }
 }
 
-impl IntoPyDict for Scope<'_> {
+#[pymethods]
+impl Scope {
+    fn as_dict<'py>(&'py self, py: Python<'py>) -> &'py PyDict {
+        let dict = PyDict::new(py);
+        dict.set_item("type", self.type_).unwrap();
+        dict.set_item("asgi", self.asgi.as_dict(py)).unwrap();
+        dict.set_item("http_version", self.http_version.as_ref())
+            .unwrap();
+        dict.set_item("method", self.method.as_str()).unwrap();
+        dict.set_item("scheme", self.scheme.as_str()).unwrap();
+        dict.set_item("path", self.path.as_str()).unwrap();
+        if let Some(ref raw_path) = self.raw_path {
+            dict.set_item("raw_path", PyBytes::new(py, raw_path.as_bytes()))
+                .unwrap();
+        } else {
+            dict.set_item("raw_path", py.None()).unwrap();
+        }
+        dict.set_item("query_string", self.query_string.as_bytes())
+            .unwrap();
+        dict.set_item("root_path", self.root_path.as_str()).unwrap();
+        let headers = PyList::new(
+            py,
+            self.headers
+                .iter()
+                .map(|(k, v)| (PyBytes::new(py, k.as_ref()), PyBytes::new(py, v.as_bytes()))),
+        );
+        dict.set_item("headers", headers).unwrap();
+
+        dict.set_item("client", {
+            if let Some(ref addr) = self.client {
+                let list = PyList::new(py, vec![addr.ip().to_string()]);
+                list.append(addr.port()).unwrap();
+                list
+            } else {
+                PyList::new(py, vec![py.None(), py.None()])
+            }
+        })
+        .unwrap();
+
+        dict.set_item("server", {
+            match &self.server {
+                ServerAddr::SocketAddr(addr) => {
+                    let list = PyList::new(py, vec![addr.ip().to_string()]);
+                    list.append(addr.port()).unwrap();
+                    list
+                }
+                ServerAddr::UnixSocket(path) => {
+                    let list = PyList::new(py, vec![path]);
+                    list.append(py.None()).unwrap();
+                    list
+                }
+            }
+        })
+        .unwrap();
+
+        if self.type_.is_websocket() {
+            if let Some(ref subprotocols) = self.subprotocols {
+                dict.set_item("subprotocols", subprotocols).unwrap();
+            }
+        }
+
+        dict
+    }
+}
+
+impl IntoPyDict for Scope {
     #[inline]
     fn into_py_dict(self, py: Python<'_>) -> &'_ PyDict {
         let dict = PyDict::new(py);
@@ -332,7 +411,7 @@ impl IntoPyDict for Scope<'_> {
             py,
             self.headers
                 .iter()
-                .map(|(k, v)| (PyBytes::new(py, k), PyBytes::new(py, v))),
+                .map(|(k, v)| (PyBytes::new(py, k.as_ref()), PyBytes::new(py, v.as_bytes()))),
         );
         dict.set_item("headers", headers).unwrap();
 
@@ -526,6 +605,7 @@ impl Sender {
             .ok_or_else(|| PyErr::new::<PyKeyError, _>("type"))?
             .extract()?;
         let type_: Type = stype.parse().map_err(|err| {
+            eprintln!("type `{:?}` is invalid, {:?}", stype, err);
             PyErr::new::<PyValueError, _>(format!("type `{:?}` is invalid, {:?}", stype, err))
         })?;
         log::trace!("type: {:?}", type_);
@@ -570,11 +650,12 @@ impl Sender {
         log::trace!("message: {:?}", message);
         let sender = self.inner.clone();
         log::trace!("sender");
-        pyo3_asyncio::tokio::future_into_py_with_locals(py, self.locals.clone(), async move {
+        pyo3_asyncio::tokio::future_into_py(py, async move {
             log::trace!("sender sending");
-            sender
-                .send(message)
-                .map_err(|err| PyErr::new::<PyException, _>(err.to_string()))
+            sender.send(message).map_err(|err| {
+                log::error!("{:?}", err);
+                PyErr::new::<PyException, _>(err.to_string())
+            })
         })
     }
 }
@@ -582,17 +663,16 @@ impl Sender {
 #[pyclass]
 pub struct RequestReceiver {
     locals: TaskLocals,
-    request: Arc<Mutex<HyperRequest<HyperBody>>>,
+    body: Arc<Mutex<HyperBody>>,
     // request: HyperRequest<HyperBody>,
 }
 
 impl RequestReceiver {
     #[inline]
-    pub fn new(locals: TaskLocals, request: HyperRequest<HyperBody>) -> RequestReceiver {
+    pub fn new(locals: TaskLocals, body: HyperBody) -> RequestReceiver {
         RequestReceiver {
             locals,
-            request: Arc::new(Mutex::new(request)),
-            // request,
+            body: Arc::new(Mutex::new(body)),
         }
     }
 }
@@ -600,10 +680,10 @@ impl RequestReceiver {
 #[pymethods]
 impl RequestReceiver {
     fn __call__<'py>(&'py self, py: Python<'py>) -> PyResult<&'py PyAny> {
-        let request = self.request.clone();
+        let body = self.body.clone();
         let future = async move {
             // let mut recv = this.borrow_mut();
-            if let Some(buf) = request.lock().await.body_mut().data().await {
+            if let Some(buf) = body.lock().await.data().await {
                 let mut buf = buf.map_err(|err| anyhow::anyhow!("{}", err))?;
                 unsafe {
                     Python::with_gil_unchecked(|py| {
