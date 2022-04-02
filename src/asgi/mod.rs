@@ -2,9 +2,8 @@ mod specs;
 
 use std::net::SocketAddr;
 
-use futures::TryFutureExt;
 use futures::{sink::SinkExt, stream::StreamExt};
-use hyper::header::{HeaderName, HeaderValue};
+use hyper::header::HeaderName;
 use hyper::http::response;
 use hyper::StatusCode;
 use hyper::{Body, Request, Response};
@@ -13,7 +12,6 @@ use hyper_tungstenite::HyperWebsocket;
 use pyo3::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc::{unbounded_channel as unbounded, UnboundedSender};
-use tokio::time::Instant;
 
 use crate::Options;
 
@@ -29,7 +27,7 @@ pub struct RequestTask {
 
 #[pymethods]
 impl RequestTask {
-    fn scope<'py>(&'py self, py: Python<'py>) -> &'py pyo3::types::PyDict {
+    fn scope<'py>(&'py self, py: Python<'py>) -> PyObject {
         self.scope.as_dict(py)
     }
 }
@@ -37,7 +35,6 @@ impl RequestTask {
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct Context {
-    begin: Instant,
     task_sender: UnboundedSender<RequestTask>,
     // listening
     local_addr: SocketAddr,
@@ -47,13 +44,11 @@ pub(crate) struct Context {
 impl Context {
     #[inline]
     pub(crate) fn new(
-        begin: Instant,
         task_sender: UnboundedSender<RequestTask>,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
     ) -> Context {
         Context {
-            begin,
             task_sender,
             local_addr,
             remote_addr,
@@ -62,15 +57,14 @@ impl Context {
 }
 
 pub(crate) struct Asgi {
-    app: PyObject,
     ctx: Context,
     opts: Options,
 }
 
 impl Asgi {
     #[inline]
-    pub(crate) fn new(app: PyObject, ctx: Context, opts: Options) -> Asgi {
-        Asgi { ctx, app, opts }
+    pub(crate) fn new(ctx: Context, opts: Options) -> Asgi {
+        Asgi { ctx, opts }
     }
 
     #[inline]

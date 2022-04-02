@@ -460,7 +460,6 @@ async fn serve(
             acceptor: acceptor.clone(),
             http: http.clone(),
             opts: opts.clone(),
-            app: opts.app.clone(),
             tx: tx.clone(),
         };
         log::trace!("accept connection from {}", remote_addr);
@@ -477,7 +476,6 @@ struct ConnAccepted {
     remote_addr: SocketAddr,
     http: Http,
     opts: Options,
-    app: Py<PyAny>,
     stream: TcpStream,
     acceptor: Acceptor,
     tx: UnboundedSender<asgi::RequestTask>,
@@ -498,14 +496,11 @@ impl ConnAccepted {
         let service = service_fn({
             move |req| {
                 let tx = self.tx.clone();
-                let app = self.app.clone();
                 let opts = self.opts.clone();
                 async move {
-                    let ctx = asgi::Context::new(begin, tx, self.local_addr, self.remote_addr);
-                    let asgi = asgi::Asgi::new(app, ctx, opts);
+                    let ctx = asgi::Context::new(tx, self.local_addr, self.remote_addr);
+                    let asgi = asgi::Asgi::new(ctx, opts);
                     asgi.serve(req).await
-                    // let body = hyper::body::Body::empty();
-                    // Ok::<hyper::Response<hyper::Body>, anyhow::Error>(hyper::Response::new(body))
                 }
             }
         });

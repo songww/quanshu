@@ -1,10 +1,16 @@
-use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use hyper::{
     body::{Buf, HttpBody},
     header::{HeaderName, HeaderValue},
     Body as HyperBody,
 };
+use once_cell::sync::Lazy;
+use parking_lot::Mutex as PMutex;
 use pyo3::{
     exceptions::{PyException, PyKeyError, PyValueError},
     prelude::*,
@@ -81,7 +87,7 @@ impl ToPyObject for AsgiVersion {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Http,              // -> "http"
     HttpRequest,       // -> "http.request"
@@ -175,14 +181,13 @@ impl FromStr for Type {
 impl<'source> FromPyObject<'source> for Type {
     #[inline]
     fn extract(obj: &'source PyAny) -> PyResult<Type> {
-        //
         let s: &PyString = obj.downcast()?;
         Type::from_str(s.to_str()?).map_err(|err| PyErr::new::<PyValueError, _>(err))
     }
 }
 
 #[non_exhaustive]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum HttpVersion {
     V1_0,
     V1_1,
@@ -248,7 +253,7 @@ impl IntoPyDict for Asgi {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum ServerAddr {
     SocketAddr(SocketAddr),
     UnixSocket(PathBuf),
@@ -323,16 +328,55 @@ impl Scope {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Hash)]
+// Type, HttpVersion, Method, Scheme, ServerAddr
+struct CacheKey((Type, HttpVersion, String, String, ServerAddr));
+
+static CACHED_SCOPES: Lazy<Arc<PMutex<HashMap<CacheKey, Py<PyDict>>>>> =
+    Lazy::new(|| Arc::new(PMutex::new(HashMap::new())));
+
 #[pymethods]
 impl Scope {
-    pub(crate) fn as_dict<'py>(&'py self, py: Python<'py>) -> &'py PyDict {
-        let dict = PyDict::new(py);
-        dict.set_item("type", self.type_).unwrap();
-        dict.set_item("asgi", self.asgi.as_dict(py)).unwrap();
-        dict.set_item("http_version", self.http_version.as_ref())
-            .unwrap();
+    pub(crate) fn as_dict<'py>(&'py self, py: Python<'py>) -> PyObject {
+        let mut caches = CACHED_SCOPES.lock();
+        let cache_key = CacheKey((
+            self.type_,
+            self.http_version.clone(),
+            self.method.clone(),
+            self.scheme.clone(),
+            self.server.clone(),
+        ));
+        let entry = caches.entry(cache_key);
+        let dict = entry
+            .or_insert_with(|| {
+                let dict = PyDict::new(py);
+                dict.set_item("type", self.type_).unwrap();
+                dict.set_item("asgi", self.asgi.as_dict(py)).unwrap();
+                dict.set_item("http_version", self.http_version.as_ref())
+                    .unwrap();
+                dict.set_item("scheme", self.scheme.as_str()).unwrap();
+                dict.set_item("root_path", self.root_path.as_str()).unwrap();
+
+                dict.set_item("server", {
+                    match &self.server {
+                        ServerAddr::SocketAddr(addr) => {
+                            let list = PyList::new(py, vec![addr.ip().to_string()]);
+                            list.append(addr.port()).unwrap();
+                            list
+                        }
+                        ServerAddr::UnixSocket(path) => {
+                            let list = PyList::new(py, vec![path]);
+                            list.append(py.None()).unwrap();
+                            list
+                        }
+                    }
+                })
+                .unwrap();
+                dict.into_py(py)
+            })
+            .clone();
+        let dict = dict.as_ref(py);
         dict.set_item("method", self.method.as_str()).unwrap();
-        dict.set_item("scheme", self.scheme.as_str()).unwrap();
         dict.set_item("path", self.path.as_str()).unwrap();
         if let Some(ref raw_path) = self.raw_path {
             dict.set_item("raw_path", PyBytes::new(py, raw_path.as_bytes()))
@@ -342,7 +386,6 @@ impl Scope {
         }
         dict.set_item("query_string", self.query_string.as_bytes())
             .unwrap();
-        dict.set_item("root_path", self.root_path.as_str()).unwrap();
         let headers = PyList::new(
             py,
             self.headers
@@ -362,29 +405,13 @@ impl Scope {
         })
         .unwrap();
 
-        dict.set_item("server", {
-            match &self.server {
-                ServerAddr::SocketAddr(addr) => {
-                    let list = PyList::new(py, vec![addr.ip().to_string()]);
-                    list.append(addr.port()).unwrap();
-                    list
-                }
-                ServerAddr::UnixSocket(path) => {
-                    let list = PyList::new(py, vec![path]);
-                    list.append(py.None()).unwrap();
-                    list
-                }
-            }
-        })
-        .unwrap();
-
         if self.type_.is_websocket() {
             if let Some(ref subprotocols) = self.subprotocols {
                 dict.set_item("subprotocols", subprotocols).unwrap();
             }
         }
 
-        dict
+        dict.into()
     }
 }
 
