@@ -16,15 +16,17 @@ use hyper::header::HeaderValue;
 use hyper::{server::conn::Http, service::service_fn};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3_asyncio::TaskLocals;
 use stream::{Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::Instant;
 use tokio_graceful_shutdown::{SubsystemHandle, Toplevel};
 use tokio_native_tls::native_tls::{Identity, TlsAcceptor};
 use tokio_native_tls::TlsStream;
 use tokio_stream as stream;
+
+pub use asgi::RequestTask;
 
 #[cfg(unix)]
 type RawFd = std::os::unix::io::RawFd;
@@ -90,7 +92,7 @@ type SocketAddrs = Vec<SocketAddr>;
 #[clap(author, version, about, long_about = None)]
 pub struct Options {
     #[clap(parse(try_from_str = try_import_app))]
-    app: PyObject,
+    pub app: PyObject,
     /// Bind to this
     #[clap(
         name = "bind",
@@ -400,7 +402,7 @@ async fn serve(
 #[inline]
 async fn serve(
     subsys: SubsystemHandle,
-    locals: pyo3_asyncio::TaskLocals,
+    tx: UnboundedSender<asgi::RequestTask>,
     mut opts: Options,
 ) -> anyhow::Result<()> {
     // TODO: lifespan here
@@ -459,7 +461,7 @@ async fn serve(
             http: http.clone(),
             opts: opts.clone(),
             app: opts.app.clone(),
-            locals: locals.clone(),
+            tx: tx.clone(),
         };
         log::trace!("accept connection from {}", remote_addr);
         subsys.start("accept-connection", |subsys| conn_accepted.handle(subsys));
@@ -477,8 +479,8 @@ struct ConnAccepted {
     opts: Options,
     app: Py<PyAny>,
     stream: TcpStream,
-    locals: TaskLocals,
     acceptor: Acceptor,
+    tx: UnboundedSender<asgi::RequestTask>,
 }
 
 impl ConnAccepted {
@@ -495,16 +497,16 @@ impl ConnAccepted {
 
         let service = service_fn({
             move |req| {
+                let tx = self.tx.clone();
                 let app = self.app.clone();
                 let opts = self.opts.clone();
-                let locals = self.locals.clone();
-                pyo3_asyncio::tokio::scope(locals.clone(), async move {
-                    let ctx = asgi::Context::new(locals, begin, self.local_addr, self.remote_addr);
+                async move {
+                    let ctx = asgi::Context::new(begin, tx, self.local_addr, self.remote_addr);
                     let asgi = asgi::Asgi::new(app, ctx, opts);
                     asgi.serve(req).await
                     // let body = hyper::body::Body::empty();
                     // Ok::<hyper::Response<hyper::Body>, anyhow::Error>(hyper::Response::new(body))
-                })
+                }
             }
         });
         // let service = service_fn(|_| async {
@@ -528,9 +530,9 @@ async fn shutingdown(subsys: SubsystemHandle) -> anyhow::Result<()> {
 }
 
 #[inline]
-pub async fn graceful(locals: TaskLocals, opts: Options) -> PyResult<()> {
+pub async fn graceful(tx: UnboundedSender<asgi::RequestTask>, opts: Options) -> PyResult<()> {
     let handle = Toplevel::new()
-        .start("serving", |subsys| serve(subsys.clone(), locals, opts))
+        .start("serving", |subsys| serve(subsys.clone(), tx, opts))
         .catch_signals()
         .handle_shutdown_requests(std::time::Duration::from_millis(500));
 
@@ -540,26 +542,8 @@ pub async fn graceful(locals: TaskLocals, opts: Options) -> PyResult<()> {
 }
 
 #[pyfunction]
-fn shutdown() {
+pub fn shutdown() {
     SHUTDOWN.notify_one()
-}
-
-#[pyfunction]
-fn run<'p>(py: Python<'p>, opts: PyRef<Options>) -> PyResult<&'p PyAny> {
-    let opts: Options = opts.clone();
-
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .worker_threads(1)
-        .thread_name("quanshu-worker")
-        .enable_io()
-        .enable_time();
-
-    pyo3_asyncio::tokio::init(builder);
-
-    let locals = pyo3_asyncio::tokio::get_current_locals(py)?;
-
-    pyo3_asyncio::tokio::future_into_py(py, graceful(locals, opts)).into()
 }
 
 /// A Python module implemented in Rust.
@@ -571,7 +555,6 @@ fn quanshu(py: Python, m: &PyModule) -> PyResult<()> {
     //     .map_err(|err| PyErr::new::<PyException, _>(format!("Cannot set Logger {}", err)))?;
 
     m.add_class::<Options>()?;
-    m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown, m)?)?;
 
     Ok(())

@@ -3,18 +3,18 @@ use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 use hyper::{
     body::{Buf, HttpBody},
     header::{HeaderName, HeaderValue},
-    Body as HyperBody, Request as HyperRequest,
+    Body as HyperBody,
 };
 use pyo3::{
     exceptions::{PyException, PyKeyError, PyValueError},
     prelude::*,
     types::{IntoPyDict, PyBytes, PyDict, PyList, PySequence, PyString},
 };
-use pyo3_asyncio::TaskLocals;
+use pyo3_futures::PyAsync;
 use tokio::sync::{mpsc::UnboundedSender, Mutex};
 
 #[non_exhaustive]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum SpecVersion {
     V2_0,
     V2_1,
@@ -50,7 +50,7 @@ impl ToPyObject for SpecVersion {
 }
 
 #[non_exhaustive]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum AsgiVersion {
     V2,
     V3,
@@ -182,7 +182,7 @@ impl<'source> FromPyObject<'source> for Type {
 }
 
 #[non_exhaustive]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum HttpVersion {
     V1_0,
     V1_1,
@@ -221,7 +221,7 @@ impl ToPyObject for HttpVersion {
 }
 
 #[pyclass]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct Asgi {
     version: AsgiVersion,
     spec_version: SpecVersion,
@@ -248,7 +248,7 @@ impl IntoPyDict for Asgi {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ServerAddr {
     SocketAddr(SocketAddr),
     UnixSocket(PathBuf),
@@ -267,7 +267,7 @@ impl From<PathBuf> for ServerAddr {
 }
 
 #[pyclass]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Scope {
     type_: Type,
     asgi: Asgi,
@@ -325,7 +325,7 @@ impl Scope {
 
 #[pymethods]
 impl Scope {
-    fn as_dict<'py>(&'py self, py: Python<'py>) -> &'py PyDict {
+    pub(crate) fn as_dict<'py>(&'py self, py: Python<'py>) -> &'py PyDict {
         let dict = PyDict::new(py);
         dict.set_item("type", self.type_).unwrap();
         dict.set_item("asgi", self.asgi.as_dict(py)).unwrap();
@@ -454,24 +454,21 @@ impl IntoPyDict for Scope {
 
 #[derive(Debug)]
 pub enum Receive {
-    HttpRequest {
-        // type_: Type,
-        body: Vec<u8>,
-        more_body: bool,
-    },
-    Disconnect, // type_: Type, // "http.disconnect"
+    /// "http.request"
+    HttpRequest { body: Vec<u8>, more_body: bool },
+    /// "http.disconnect"
+    Disconnect,
 
-    // websocket
-    // websocket.connect
+    /// websocket
+    /// websocket.connect
     WebsocketConnect,
+    /// websocket.receive
     WebsocketReceive {
         bytes: Option<Vec<u8>>,
         text: Option<String>,
     },
-    WebsocketDisconnect {
-        // websocket.disconnect
-        code: u32,
-    },
+    /// websocket.disconnect
+    WebsocketDisconnect { code: u32 },
 }
 
 impl IntoPy<Py<PyAny>> for Receive {
@@ -479,11 +476,7 @@ impl IntoPy<Py<PyAny>> for Receive {
     fn into_py(self, py: Python) -> Py<PyAny> {
         let d = PyDict::new(py);
         match self {
-            Receive::HttpRequest {
-                // type_,
-                body,
-                more_body,
-            } => {
+            Receive::HttpRequest { body, more_body } => {
                 d.set_item("type", Type::HttpRequest).unwrap();
                 d.set_item("body", body).unwrap();
                 d.set_item("more_body", more_body).unwrap();
@@ -563,15 +556,15 @@ pub enum Send {
 }
 
 #[pyclass]
+#[derive(Clone, Debug)]
 pub struct Sender {
-    locals: TaskLocals,
     inner: UnboundedSender<Send>,
 }
 
 impl Sender {
     #[inline]
-    pub fn new(locals: TaskLocals, tx: UnboundedSender<Send>) -> Sender {
-        Sender { locals, inner: tx }
+    pub fn new(tx: UnboundedSender<Send>) -> Sender {
+        Sender { inner: tx }
     }
 }
 
@@ -598,8 +591,13 @@ fn parse_headers(headers: &PyAny) -> PyResult<Vec<(Vec<u8>, Vec<u8>)>> {
 
 #[pymethods]
 impl Sender {
-    fn __call__<'a>(&'a self, py: Python<'a>, event: &'a PyDict) -> PyResult<&'a PyAny> {
+    fn __call__<'a>(
+        &'a self,
+        py: Python<'a>,
+        event: &'a PyDict,
+    ) -> PyResult<PyAsync<PyResult<()>>> {
         log::trace!("Sender: {:?}", event);
+        // println!("Sender: {:?}", event);
         let stype: &str = event
             .get_item("type")
             .ok_or_else(|| PyErr::new::<PyKeyError, _>("type"))?
@@ -609,6 +607,7 @@ impl Sender {
             PyErr::new::<PyValueError, _>(format!("type `{:?}` is invalid, {:?}", stype, err))
         })?;
         log::trace!("type: {:?}", type_);
+        // println!("type: {:?}", type_);
         let message = match type_ {
             Type::HttpResponseStart => {
                 let status: u16 = event
@@ -650,28 +649,36 @@ impl Sender {
         log::trace!("message: {:?}", message);
         let sender = self.inner.clone();
         log::trace!("sender");
-        pyo3_asyncio::tokio::future_into_py(py, async move {
+        // println!("sender");
+        Ok(PyAsync::from(async move {
             log::trace!("sender sending");
+            // println!("sender sending");
             sender.send(message).map_err(|err| {
                 log::error!("{:?}", err);
                 PyErr::new::<PyException, _>(err.to_string())
             })
-        })
+        }))
     }
 }
 
 #[pyclass]
+#[derive(Debug)]
 pub struct RequestReceiver {
-    locals: TaskLocals,
     body: Arc<Mutex<HyperBody>>,
-    // request: HyperRequest<HyperBody>,
+}
+
+impl Clone for RequestReceiver {
+    fn clone(&self) -> Self {
+        RequestReceiver {
+            body: self.body.clone(),
+        }
+    }
 }
 
 impl RequestReceiver {
     #[inline]
-    pub fn new(locals: TaskLocals, body: HyperBody) -> RequestReceiver {
+    pub fn new(body: HyperBody) -> RequestReceiver {
         RequestReceiver {
-            locals,
             body: Arc::new(Mutex::new(body)),
         }
     }
@@ -679,11 +686,12 @@ impl RequestReceiver {
 
 #[pymethods]
 impl RequestReceiver {
-    fn __call__<'py>(&'py self, py: Python<'py>) -> PyResult<&'py PyAny> {
+    fn __call__<'py>(&'py self, py: Python<'py>) -> PyResult<PyAsync<PyResult<PyObject>>> {
         let body = self.body.clone();
         let future = async move {
             // let mut recv = this.borrow_mut();
-            if let Some(buf) = body.lock().await.data().await {
+            let mut body = body.lock().await;
+            if let Some(buf) = body.data().await {
                 let mut buf = buf.map_err(|err| anyhow::anyhow!("{}", err))?;
                 unsafe {
                     Python::with_gil_unchecked(|py| {
@@ -712,8 +720,9 @@ impl RequestReceiver {
         };
         // unsafe {
         //     Python::with_gil_unchecked(|py| {
-        pyo3_asyncio::tokio::local_future_into_py_with_locals(py, self.locals.clone(), future)
+        // pyo3_asyncio::tokio::local_future_into_py_with_locals(py, self.locals.clone(), future)
         // })
         // }
+        Ok(future.into())
     }
 }

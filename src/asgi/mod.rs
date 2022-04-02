@@ -11,20 +11,35 @@ use hyper::{Body, Request, Response};
 use hyper_tungstenite::tungstenite::Message;
 use hyper_tungstenite::HyperWebsocket;
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyDict};
-use pyo3_asyncio::tokio::scope as scope_future;
-use pyo3_asyncio::TaskLocals;
 use tokio::select;
-use tokio::sync::mpsc::unbounded_channel as unbounded;
+use tokio::sync::mpsc::{unbounded_channel as unbounded, UnboundedSender};
 use tokio::time::Instant;
 
 use crate::Options;
 
-#[derive(Debug, Clone)]
+#[pyclass]
+#[derive(Debug)]
+pub struct RequestTask {
+    scope: specs::Scope,
+    #[pyo3(get)]
+    receive: specs::RequestReceiver,
+    #[pyo3(get)]
+    send: specs::Sender,
+}
+
+#[pymethods]
+impl RequestTask {
+    fn scope<'py>(&'py self, py: Python<'py>) -> &'py pyo3::types::PyDict {
+        self.scope.as_dict(py)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct Context {
-    locals: TaskLocals,
-    // listening
     begin: Instant,
+    task_sender: UnboundedSender<RequestTask>,
+    // listening
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
 }
@@ -32,14 +47,14 @@ pub(crate) struct Context {
 impl Context {
     #[inline]
     pub(crate) fn new(
-        locals: TaskLocals,
         begin: Instant,
+        task_sender: UnboundedSender<RequestTask>,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
     ) -> Context {
         Context {
             begin,
-            locals,
+            task_sender,
             local_addr,
             remote_addr,
         }
@@ -65,11 +80,11 @@ impl Asgi {
 
             let ctx = self.ctx.clone();
             // Spawn a task to handle the websocket connection.
-            tokio::spawn(scope_future(self.ctx.locals.clone(), async move {
+            tokio::spawn(async move {
                 if let Err(e) = serve_websocket(ctx, websocket).await {
                     log::error!("Error in websocket connection: {}", e);
                 }
-            }));
+            });
             // Return the response so the spawned future can continue.
             Ok(response)
         } else {
@@ -118,25 +133,29 @@ impl Asgi {
             self.ctx.local_addr.into(),
         );
 
-        let locals = self.ctx.locals.clone();
-
         let (tx, mut resp_rx) = unbounded();
 
-        let send = specs::Sender::new(locals.clone(), tx);
-        let receive = specs::RequestReceiver::new(locals.clone(), payload);
+        let send = specs::Sender::new(tx);
+        let receive = specs::RequestReceiver::new(payload);
 
-        let task = pyo3::Python::with_gil(|py| -> PyResult<_> {
-            // let scope = scope.into_py_dict(py);
-            let el = self.ctx.locals.event_loop(py);
-            let coro = self.app.as_ref(py).call1((scope, receive, send))?;
-            let task = el.call_method1("create_task", (coro,))?;
-            pyo3_asyncio::into_future_with_locals(&locals, task)
-        })
-        .unwrap();
-        let _app_processing = tokio::task::spawn(task).and_then(|p| async move {
-            println!("app task done {:?}", p);
-            Ok(())
-        });
+        self.ctx.task_sender.send(RequestTask {
+            scope,
+            receive,
+            send,
+        })?;
+        // let task = pyo3::Python::with_gil(|py| -> PyResult<_> {
+        //     // let scope = scope.into_py_dict(py);
+        //     let el = self.ctx.locals.event_loop(py);
+        //     let coro = self.app.as_ref(py).call1((scope, receive, send))?;
+        //     let task = el.call_method1("create_task", (coro,))?;
+        //     // pyo3_asyncio::into_future_with_locals(&locals, task)
+        //     Ok(task.to_object(py))
+        // })
+        // .unwrap();
+        // let _app_processing = tokio::task::spawn(task).and_then(|p| async move {
+        //     println!("app task done {:?}", p);
+        //     Ok(())
+        // });
 
         // log::trace!("waiting resp");
         let head = resp_rx.recv().await;
@@ -160,7 +179,7 @@ impl Asgi {
                 headers_map.append(HeaderName::try_from(k)?, v.try_into()?);
             }
         } else {
-            // panic!("ResponseStart required {:?}!", head);
+            panic!("ResponseStart required {:?}!", head);
         };
         // if connection_close {
         //     resp.headers_mut().insert(
@@ -193,26 +212,23 @@ impl Asgi {
         }
 
         // // let status = resp.status();
-        // let _further = tokio::spawn(async move {
-        //     while let Some(specs::Send::ResponseBody {
-        //         type_: _,
-        //         body: chunk,
-        //         more_body,
-        //     }) = resp_rx.recv().await
-        //     {
-        //         log::trace!("waiting more resp body");
-        //         body_sender
-        //             .send_data(chunk.into())
-        //             .await
-        //             .expect("Send response body failed");
-        //         if !more_body {
-        //             break;
-        //         }
-        //     }
-        //     if access_log {
-        //         // crate::access::log(remote_addr, method, uri, http_version, status, begin);
-        //     }
-        // });
+        let _further = tokio::spawn(async move {
+            while let Some(specs::Send::ResponseBody {
+                type_: _,
+                body: chunk,
+                more_body,
+            }) = resp_rx.recv().await
+            {
+                log::trace!("waiting more resp body");
+                body_sender
+                    .send_data(chunk.into())
+                    .await
+                    .expect("Send response body failed");
+                if !more_body {
+                    break;
+                }
+            }
+        });
         Ok(resp)
     }
 }
