@@ -332,13 +332,14 @@ impl Scope {
 // Type, HttpVersion, Method, Scheme, ServerAddr
 struct CacheKey((Type, HttpVersion, String, String, ServerAddr));
 
-static CACHED_SCOPES: Lazy<Arc<PMutex<HashMap<CacheKey, Py<PyDict>>>>> =
-    Lazy::new(|| Arc::new(PMutex::new(HashMap::new())));
-
 #[pymethods]
 impl Scope {
     pub(crate) fn as_dict<'py>(&'py self, py: Python<'py>) -> PyObject {
-        let mut caches = CACHED_SCOPES.lock();
+        static mut CACHED_SCOPES: Lazy<HashMap<CacheKey, Py<PyDict>>> =
+            Lazy::new(|| HashMap::new());
+        // TODO: use lru cache to prevent too many items.
+        // SAFETY: With GilGuard.
+        let caches = unsafe { &mut CACHED_SCOPES };
         let cache_key = CacheKey((
             self.type_,
             self.http_version.clone(),
@@ -355,6 +356,7 @@ impl Scope {
                 dict.set_item("http_version", self.http_version.as_ref())
                     .unwrap();
                 dict.set_item("scheme", self.scheme.as_str()).unwrap();
+                dict.set_item("method", self.method.as_str()).unwrap();
                 dict.set_item("root_path", self.root_path.as_str()).unwrap();
 
                 dict.set_item("server", {
@@ -376,14 +378,21 @@ impl Scope {
             })
             .clone();
         let dict = dict.as_ref(py);
-        dict.set_item("method", self.method.as_str()).unwrap();
-        dict.set_item("path", self.path.as_str()).unwrap();
+        static mut PATH_INTERNS: Lazy<HashMap<String, Py<PyString>>> = Lazy::new(|| HashMap::new());
+        // TODO: use lru cache to prevent too many items.
+        // SAFETY: With GilGuard.
+        let interns = unsafe { &mut PATH_INTERNS };
+        let path = interns
+            .entry(self.path.clone())
+            .or_insert_with(|| PyString::new(py, &self.path).into_py(py));
+        dict.set_item("path", path.as_ref(py)).unwrap();
         if let Some(ref raw_path) = self.raw_path {
             dict.set_item("raw_path", PyBytes::new(py, raw_path.as_bytes()))
                 .unwrap();
         } else {
             dict.set_item("raw_path", py.None()).unwrap();
         }
+        // TODO: with lru cache to increase performance.
         dict.set_item("query_string", self.query_string.as_bytes())
             .unwrap();
         let headers = PyList::new(
@@ -392,6 +401,7 @@ impl Scope {
                 .iter()
                 .map(|(k, v)| (PyBytes::new(py, k.as_ref()), PyBytes::new(py, v.as_bytes()))),
         );
+        // TODO: How to optimize there?
         dict.set_item("headers", headers).unwrap();
 
         dict.set_item("client", {
@@ -412,70 +422,6 @@ impl Scope {
         }
 
         dict.into()
-    }
-}
-
-impl IntoPyDict for Scope {
-    #[inline]
-    fn into_py_dict(self, py: Python<'_>) -> &'_ PyDict {
-        let dict = PyDict::new(py);
-        dict.set_item("type", self.type_).unwrap();
-        dict.set_item("asgi", self.asgi.into_py_dict(py)).unwrap();
-        dict.set_item("http_version", self.http_version).unwrap();
-        dict.set_item("method", self.method).unwrap();
-        dict.set_item("scheme", self.scheme).unwrap();
-        dict.set_item("path", self.path).unwrap();
-        if let Some(raw_path) = self.raw_path {
-            dict.set_item("raw_path", PyBytes::new(py, raw_path.as_bytes()))
-                .unwrap();
-        } else {
-            dict.set_item("raw_path", py.None()).unwrap();
-        }
-        dict.set_item("query_string", self.query_string.as_bytes())
-            .unwrap();
-        dict.set_item("root_path", self.root_path).unwrap();
-        let headers = PyList::new(
-            py,
-            self.headers
-                .iter()
-                .map(|(k, v)| (PyBytes::new(py, k.as_ref()), PyBytes::new(py, v.as_bytes()))),
-        );
-        dict.set_item("headers", headers).unwrap();
-
-        dict.set_item("client", {
-            if let Some(ref addr) = self.client {
-                let list = PyList::new(py, vec![addr.ip().to_string()]);
-                list.append(addr.port()).unwrap();
-                list
-            } else {
-                PyList::new(py, vec![py.None(), py.None()])
-            }
-        })
-        .unwrap();
-
-        dict.set_item("server", {
-            match self.server {
-                ServerAddr::SocketAddr(addr) => {
-                    let list = PyList::new(py, vec![addr.ip().to_string()]);
-                    list.append(addr.port()).unwrap();
-                    list
-                }
-                ServerAddr::UnixSocket(path) => {
-                    let list = PyList::new(py, vec![path]);
-                    list.append(py.None()).unwrap();
-                    list
-                }
-            }
-        })
-        .unwrap();
-
-        if self.type_.is_websocket() {
-            if let Some(subprotocols) = self.subprotocols {
-                dict.set_item("subprotocols", subprotocols).unwrap();
-            }
-        }
-
-        dict
     }
 }
 
