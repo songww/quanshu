@@ -526,13 +526,13 @@ async fn shutingdown(subsys: SubsystemHandle) -> anyhow::Result<()> {
 
 #[inline]
 pub async fn graceful(tx: UnboundedSender<asgi::RequestTask>, opts: Options) -> PyResult<()> {
-    let handle = Toplevel::new()
+    Toplevel::new()
         .start("serving", |subsys| serve(subsys.clone(), tx, opts))
         .catch_signals()
-        .handle_shutdown_requests(std::time::Duration::from_millis(500));
+        .handle_shutdown_requests::<anyhow::Error>(std::time::Duration::from_millis(500))
+        .await?;
 
     // to map anyhow::Error -> pyo3::Error
-    handle.await?;
     Ok(())
 }
 

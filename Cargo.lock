@@ -569,9 +569,9 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31f4c6746584866f0feabcc69893c5b51beef3831656a968ed7ae254cdc4fd03"
+checksum = "ff8670570af52249509a86f5e3e18a08c60b177071826898fde8997cf5f6bfbb"
 dependencies = [
  "bytes",
  "fnv",
@@ -627,9 +627,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-tungstenite"
-version = "0.6.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2e9b2a23919b72e723692a5b81330ecdd640bba2f2d0fc0089b7abf0be67bf7"
+checksum = "b0ea2c1b59596d6b1302fe616266257a58b079f68fee329d6d111f79241cb7fd"
 dependencies = [
  "hyper",
  "pin-project",
@@ -1395,9 +1395,9 @@ checksum = "73473c0e59e6d5812c5dfe2a064a6444949f089e20eec9a2e5506596494e4623"
 
 [[package]]
 name = "syn"
-version = "1.0.91"
+version = "1.0.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b683b2b825c8eef438b77c36a06dc262294da3d5a5813fac20da149241dcd44d"
+checksum = "7ff7c592601f11445996a06f8ad0c27f094a58857c2f89e97974ab9235b92c52"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1495,9 +1495,9 @@ checksum = "cda74da7e1a664f795bb1f8a87ec406fb89a02522cf6e50620d016add6dbbf5c"
 
 [[package]]
 name = "tokio"
-version = "1.17.0"
+version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2af73ac49756f3f7c01172e34a23e5d0216f6c32333757c2c61feb2bbff5a5ee"
+checksum = "0f48b6d60512a392e34dbf7fd456249fd2de3c83669ab642e021903f4015185b"
 dependencies = [
  "bytes",
  "libc",
@@ -1515,14 +1515,14 @@ dependencies = [
 
 [[package]]
 name = "tokio-graceful-shutdown"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b9614e6d7b687b4daf9b5191d45039258b19405fb1493051cee400f29ec0e57"
+checksum = "ff0a1b63da4534280ab4a998380dd451cd8e3b503a0e99cc8bafcc34e966f861"
 dependencies = [
- "anyhow",
  "async-recursion",
  "futures",
  "log",
+ "thiserror",
  "tokio",
  "tokio-util 0.7.1",
 ]
