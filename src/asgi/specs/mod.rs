@@ -14,7 +14,7 @@ use parking_lot::Mutex as PMutex;
 use pyo3::{
     exceptions::{PyException, PyKeyError, PyValueError},
     prelude::*,
-    types::{IntoPyDict, PyBytes, PyDict, PyList, PySequence, PyString},
+    types::{IntoPyDict, PyBool, PyBytes, PyDict, PyList, PySequence, PyString},
 };
 use pyo3_futures::PyAsync;
 use tokio::sync::{mpsc::UnboundedSender, Mutex};
@@ -181,7 +181,7 @@ impl FromStr for Type {
 impl<'source> FromPyObject<'source> for Type {
     #[inline]
     fn extract(obj: &'source PyAny) -> PyResult<Type> {
-        let s: &PyString = obj.downcast()?;
+        let s: &PyString = obj.cast_as()?;
         Type::from_str(s.to_str()?).map_err(|err| PyErr::new::<PyValueError, _>(err))
     }
 }
@@ -554,8 +554,16 @@ fn parse_headers(headers: &PyAny) -> PyResult<Vec<(Vec<u8>, Vec<u8>)>> {
                 )))
             } else {
                 Ok((
-                    header.get_item(0)?.extract()?,
-                    header.get_item(1)?.extract()?,
+                    header
+                        .get_item(0)?
+                        .cast_as::<PyBytes>()?
+                        .as_bytes()
+                        .to_vec(),
+                    header
+                        .get_item(1)?
+                        .cast_as::<PyBytes>()?
+                        .as_bytes()
+                        .to_vec(),
                 ))
             }
         })
@@ -602,12 +610,12 @@ impl Sender {
             }
             Type::HttpResponseBody => {
                 let body: Vec<u8> = if let Some(body) = event.get_item("body") {
-                    body.extract()?
+                    body.cast_as::<PyBytes>()?.as_bytes().to_vec()
                 } else {
                     vec![]
                 };
                 let more_body: bool = if let Some(more) = event.get_item("more_body") {
-                    more.extract()?
+                    more.cast_as::<PyBool>()?.is_true()
                 } else {
                     false
                 };
