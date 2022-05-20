@@ -61,6 +61,6 @@ features = ["auto-initialize", "anyhow", "abi3"]
 criterion = "0.3"
 
 [profile.release]
-lto = true
+lto = "fat"
 codegen-units = 1
 opt-level = 3
